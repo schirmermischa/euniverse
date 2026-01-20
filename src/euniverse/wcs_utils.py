@@ -19,11 +19,6 @@ class WCSConverter:
         ra, dec = self.wcs.wcs_pix2world([[x, y]], 0)[0]
         return ra, dec
 
-    def world_to_pixel_old(self, sky_coord):
-        ra = sky_coord.ra.deg
-        dec = sky_coord.dec.deg
-        x, y = self.wcs.all_world2pix([[ra, dec]], 0)[0]
-        return x, y
 
     def world_to_pixel(self, sky_coord):
         """

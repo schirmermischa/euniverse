@@ -49,10 +49,18 @@ class ControlDock(QWidget):
         # Prevent black background on the dock widget
         self.setAutoFillBackground(False)
 
+        pale_yellow = QColor(255, 255, 204)
+
+
         # Load UI directly onto 'self'
-#        ui_file = os.path.join(os.path.dirname(__file__), "control_dock.ui")
         from euniverse import get_resource
         ui_file = get_resource('control_dock.ui')
+        if not os.path.exists(ui_file):
+            print(f"CRITICAL: UI file not found at {ui_file}")
+            # Fallback: Create a basic label so the app doesn't just vanish
+            self.layout = QVBoxLayout(self)
+            self.layout.addWidget(QLabel("Error: control_dock.ui missing."))
+            return
         uic.loadUi(ui_file, self)
 
         # Configure sliders
@@ -80,22 +88,22 @@ class ControlDock(QWidget):
             }
         """
 
-        # Button stylesheet
         button_style_photo = """
-            QPushButton, QPushButton:checked, QPushButton:pressed {
-                border-width: 1px !important;
-                outline: none !important;
-                padding: 1px !important;
-                margin: 1px !important;
-                background: none !important;
-            }
-            QPushButton:checked {
-                background: #d0d0d0;
-            }
-            QPushButton:hover {
-                background: #666666;
-            }
-        """
+            QPushButton {
+                 border: 1px solid #444444;
+                 outline: none;
+                 padding: 1px;
+                 margin: 1px;
+                 background-color: transparent; 
+             }
+             QPushButton:hover, QPushButton:checked {
+                 background-color: #ffffe0;
+                 border: 1px solid #444444;
+             }
+             QPushButton:pressed {
+                 background-color: #ffffe0;
+             }
+         """
 
         # Assign icons and stylesheet
         self.sunglassesPushButton.setIcon(create_sunglasses_icon())
@@ -113,26 +121,21 @@ class ControlDock(QWidget):
         self.plotPushButton.setStyleSheet(button_style)
         self.plotPushButton.toggled.connect(self.on_plot_toggled)
 
-        self.photoFrame.setFrameStyle(QFrame.NoFrame)
-        icon_label = QLabel(self.photoFrame)
-        camera_icon = create_camera_icon()
-        icon_label.setPixmap(camera_icon.pixmap(32, 32))
+        self.photoPushButton.setIcon(create_camera_icon())
+        self.photoPushButton.setIconSize(QSize(32,32))
+        self.photoPushButton.setStyleSheet(button_style_photo)
+        self.photoPushButton.toggled.connect(self.photoPushButton_requested)
 
-        self.photoLargePushButton.setIcon(create_largephoto_icon())
-        self.photoLargePushButton.setIconSize(QSize(28, 28))
-        self.photoLargePushButton.setStyleSheet(button_style_photo)
-        self.photoLargePushButton.toggled.connect(self.on_photoLargePushButton_clicked)
+        # Helper to create the dual-state icon
+        def make_toggle_icon(self, icon_func):
+            """Creates a QIcon with two states: Normal (transparent) and On (pale yellow)."""
+            icon = QIcon()
+            # Passive/Off State
+            icon.addPixmap(icon_func(Qt.transparent), QIcon.Normal, QIcon.Off)
+            # Active/On State
+            icon.addPixmap(icon_func(pale_yellow), QIcon.Normal, QIcon.On)
+            return icon
 
-        self.photoMediumPushButton.setIcon(create_mediumphoto_icon())
-        self.photoMediumPushButton.setIconSize(QSize(28, 28))
-        self.photoMediumPushButton.setStyleSheet(button_style_photo)
-        self.photoMediumPushButton.toggled.connect(self.on_photoMediumPushButton_clicked)
-
-        self.photoSmallPushButton.setIcon(create_smallphoto_icon())
-        self.photoSmallPushButton.setIconSize(QSize(28, 28))
-        self.photoSmallPushButton.setStyleSheet(button_style_photo)
-        self.photoSmallPushButton.toggled.connect(self.on_photoSmallPushButton_clicked)
-    
         # Override coord_list keyPressEvent
         def coord_list_key_press(event):
             if event.key() == Qt.Key_Delete:
@@ -140,7 +143,7 @@ class ControlDock(QWidget):
                 self.viewer.keyPressEvent(event)
             else:
                 QListWidget.keyPressEvent(self.coord_list, event)
-        self.coord_list.keyPressEvent = coord_list_key_press
+            self.coord_list.keyPressEvent = coord_list_key_press
 
 #        self.setLayout(main_layout)
 
@@ -222,32 +225,25 @@ class ControlDock(QWidget):
         base_name = os.path.splitext(os.path.basename(image_path))[0]
         username = getpass.getuser()
         timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-        csv_filename = f"{base_name}_{username}_{timestamp}.csv"
+        csv_filename = f"{self.viewer.dirpath}/{base_name}_{username}_{timestamp}.csv"
+
         with open(csv_filename, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(['RA', 'Dec', 'Classifier'])
             for _, ra, dec, classifier, _ in self.viewer.circles:
                 writer.writerow([ra, dec, classifier])
         self.update_status(f"Saved targets to {csv_filename}")
-        csv_filename_rel = f"{self.viewer.dirpath}/{base_name}_{username}_{timestamp}.csv"
-        with open(csv_filename_rel, 'w', newline='') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(['RA', 'Dec', 'Classifier'])
-            for _, ra, dec, classifier, _ in self.viewer.circles:
-                writer.writerow([ra, dec, classifier])
-        self.update_status(f"Saved targets to {csv_filename}")
-#        print(f"Saved targets to {csv_filename}")
 
     def on_submit_targets(self):
         if not self.viewer or not self.viewer.circles:
-            # No targets to submit.
             return
-#        image_path = self.viewer.default_image if self.viewer.default_image else "image"
+
         image_path = "image"
         base_name = os.path.splitext(os.path.basename(image_path))[0]
         username = getpass.getuser()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_filename = f"{base_name}_{username}_{timestamp}.csv"
+        csv_filename = f"{self.viewer.dirpath}/{base_name}_{username}_{timestamp}.csv"
+        
         with open(csv_filename, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(['RA', 'Dec', 'Classifier'])
@@ -256,18 +252,25 @@ class ControlDock(QWidget):
         try:
             with open(csv_filename, 'rb') as f:
                 files = {'file': (csv_filename, f, 'text/csv')}
-                response = requests.post("https://www.euclid-ec.org/target_receiver", files=files)
+                # Added timeout=10 to prevent infinite hang
+                response = requests.post(
+                    "https://www.euclid-ec.org/target_receiver",  # this URL does not yet exist
+                    files=files, 
+                    timeout=10 
+                )
+            
             if response.status_code == 200:
-                print(f"Successfully uploaded {csv_filename} to server.")
+                self.update_status("Successfully uploaded targets.")
             else:
-                print(f"Failed to upload {csv_filename}. Status code: {response.status_code}")
-        except Exception as e:
-            print(f"Error uploading {csv_filename}: {e}")
+                self.update_status(f"Upload failed (Status: {response.status_code})")
+        except requests.exceptions.RequestException as e:
+            self.update_status("Network error: Could not reach server.")
+            print(f"Submission error: {e}")
 
     def slider_pressed(self):
         # Hide the MER catalog if it is shown
         if self.MER_PushButton.isChecked():
-            self.viewer.hide_MER()
+            self.viewer.toggle_MER()
         self.viewcenter = self.viewer.get_current_view_center()
             
     def slider_changed(self):
@@ -283,7 +286,7 @@ class ControlDock(QWidget):
             QApplication.restoreOverrideCursor()
             # Show the catalog again if it was shown before
             if self.MER_PushButton.isChecked():
-                self.viewer.show_MER()
+                self.viewer.toggle_MER()
             self.viewer.restore_view_center(self.viewcenter)
                 
     def degrees_to_sexagesimal(self, ra, dec):
@@ -343,33 +346,74 @@ class ControlDock(QWidget):
                 print(f"Failed to parse coordinates from: {text}")
         return None, None
 
-    def on_coord_list_item_clicked(self, item):
-        if self.viewer and self.viewer.wcs and self.viewer.original_image is not None:
-            text = item.text()
+    def _highlight_selected_circle(self, ra, dec):
+        """
+        Helper to visually highlight a specific circle on the image viewer.
+        Ensures previously selected circles are returned to their normal state.
+        """
+        if not self.viewer or not self.viewer.circles:
+            return
+
+        # 1. Reset the previously selected circle if it exists
+        if self.selected_circle:
             try:
-                ra_str, dec_str, _ = text.split(", ", 2)
-                ra = float(ra_str)
-                dec = float(dec_str)
-                sky_coord = SkyCoord(ra * u.deg, dec * u.deg, frame='icrs')
-                x, y = self.viewer.wcs.world_to_pixel(sky_coord)
-                y = self.viewer.original_image.shape[0] - y
-                self.viewer.reset_zoom()
-                self.viewer.centerOn(QPointF(x, y))
-                self.viewer.refresh_preview()
-                for circle, circle_ra, circle_dec, _, normal_thickness in self.viewer.circles:
-                    if abs(circle_ra - ra) < 1e-6 and abs(circle_dec - dec) < 1e-6:
-                        if self.selected_circle and self.selected_circle != circle:
-                            normal_pen = self.selected_circle.pen()
-                            normal_pen.setWidthF(normal_thickness)
-                            self.selected_circle.setPen(normal_pen)
-                        pen = circle.pen()
-                        pen.setWidthF(normal_thickness * 1.5)
-                        circle.setPen(pen)
-                        self.selected_circle = circle
-                        self.viewer.scene.update()
+                # We store the 'normal_thickness' in the circle tuple: 
+                # (item, ra, dec, classifier, normal_thickness)
+                for item, c_ra, c_dec, _, normal_thick in self.viewer.circles:
+                    if item == self.selected_circle:
+                        old_pen = item.pen()
+                        old_pen.setWidthF(normal_thick)
+                        item.setPen(old_pen)
                         break
-            except (ValueError, IndexError):
-                print(f"Failed to parse coordinates from: {text}")
+            except Exception:
+                # If the item was deleted or is invalid, just move on
+                pass
+
+        # 2. Find and highlight the new circle
+        for circle_item, c_ra, c_dec, _, normal_thick in self.viewer.circles:
+            # Use a small epsilon for float comparison of coordinates
+            if abs(c_ra - ra) < 1e-6 and abs(c_dec - dec) < 1e-6:
+                pen = circle_item.pen()
+                # Highlight by increasing thickness (e.g., by 50%)
+                pen.setWidthF(normal_thick * 1.5)
+                circle_item.setPen(pen)
+                
+                # Update the tracker
+                self.selected_circle = circle_item
+                
+                # Force the scene to redraw the highlight
+                self.viewer.scene.update()
+                break
+
+    def on_coord_list_item_clicked(self, item):
+        """Safely centers the viewer on a selected catalog object."""
+        if not (self.viewer and self.viewer.wcs and self.viewer.original_image is not None):
+            self.update_status("Cannot center: No image or WCS loaded.")
+            return
+
+        text = item.text()
+        try:
+            # Safer parsing using split and strip
+            parts = text.split(",")
+            ra = float(parts[0].strip())
+            dec = float(parts[1].strip())
+            
+            sky_coord = SkyCoord(ra * u.deg, dec * u.deg, frame='icrs')
+            x, y = self.viewer.wcs.world_to_pixel(sky_coord)
+            
+            # Use pathlib-style shape access
+            img_height = self.viewer.original_image.shape[0]
+            y = img_height - y
+            
+            self.viewer.reset_zoom()
+            self.viewer.centerOn(QPointF(x, y))
+            self.viewer.refresh_preview()
+            
+            # Highlight logic...
+            self._highlight_selected_circle(ra, dec)
+
+        except (ValueError, IndexError) as e:
+            self.update_status(f"Error parsing coordinates: {e}")
 
     def update_preview(self, pixmap):
         if self.viewer and self.viewer.is_displaying_preview:
@@ -458,23 +502,18 @@ class ControlDock(QWidget):
     def on_sunglasses_toggled(self, checked):
         pass
 
-    def on_plot_toggled(self, checked):
-        if checked:
-            if self.viewer.catalog_manager.catalog is not None:
-                if not self.plot_dialog:
-                    self.plot_dialog = PlotDialog(self.viewer.catalog_manager, self)
-                    # Connect the dialog's accepted signal to our new slot
-                    self.plot_dialog.finished.connect(self.on_plot_dialog_closed)
-                    self.plot_dialog.lasso_points_selected.connect(self.viewer.catalog_manager.handle_selected_objects)
-                self.plot_dialog.show()
-            else:
-                print("Warning: No catalog loaded. Cannot open plotter.")
-                # self.plotPushButton should be part of ControlDock
-                if self.plotPushButton:
-                    self.plotPushButton.setChecked(False) # Uncheck the button
+    def on_plot_toggled(self):
+
+        if self.viewer and self.viewer.catalog_manager:
+            self.plot_dialog = PlotDialog(
+                self.viewer.catalog_manager, 
+                self.viewer, 
+                parent=self
+            )
+            self.plot_dialog.show()
         else:
-            if self.plot_dialog:
-                self.plot_dialog.hide()
+            print("Error: Could not locate ImageViewer or CatalogManager.")
+
 
     def on_plot_dialog_closed(self):
         """
@@ -484,38 +523,91 @@ class ControlDock(QWidget):
             self.plotPushButton.setChecked(False)
 
 
+#    def on_load_image(self):
+#        """Trigger the file dialog in the image viewer."""
+#        if self.viewer:
+#            print("shit")
+#            self.viewer.open_file_dialog()
+
+
     def on_MER_toggled(self, checked):
-        if self.viewer:
-            if checked:
-                QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
-                self.viewer.show_MER()
-                if self.viewer.catalog_manager and self.viewer.catalog_manager.catalog:
+        """
+        Handles the display of the MER catalog and associated table dialog.
+        Refactored for robustness with explicit state cleanup and visual feedback.
+        """
+        if not self.viewer:
+            return
+
+        if checked:
+            # 1. Provide immediate visual feedback for heavy processing
+            QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+            QApplication.processEvents() # Force cursor update
+            
+            try:
+                # 2. Trigger the catalog overlay
+                self.viewer.toggle_MER()
+                
+                # 3. Check if a valid, non-empty catalog actually exists
+                cat_manager = self.viewer.catalog_manager
+                if cat_manager and cat_manager.catalog is not None and len(cat_manager.catalog) > 0:
+                    # Only create the dialog if it doesn't already exist
                     if self.table_dialog is None:
-                        self.table_dialog = TableDialog(self.viewer.catalog_manager.catalog, self.viewer, self)
+                        # Fetch the path from the catalog manager
+                        catalog_name = getattr(cat_manager, 'catalog_name', None)
+                        self.table_dialog = TableDialog(cat_manager.catalog, self.viewer, catalog_name, self)
                         self.table_dialog.show()
                 else:
-                    print("No catalog available to display")
-                    self.MER_PushButton.setChecked(False)  # Optionally, uncheck the button
+                    # 4. Handle missing/empty data gracefully
+                    self.update_status("No MER catalog data available for this tile.")
+                    print("Warning: Attempted to show MER, but catalog is missing or empty.")
+                    
+                    # Uncheck the button since we can't fulfill the request
+                    self.MER_PushButton.blockSignals(True)
+                    self.MER_PushButton.setChecked(False)
+                    self.MER_PushButton.blockSignals(False)
+            
+            except Exception as e:
+                self.update_status(f"Error displaying MER: {e}")
+                print(f"Critical error in on_MER_toggled: {e}")
+            
+            finally:
+                # Always restore the cursor, even if an error occurs
                 QApplication.restoreOverrideCursor()
-            else:
-                self.viewer.hide_MER()
-                if self.table_dialog:
-                    self.table_dialog.close()
-                    self.table_dialog = None
+        
+        else:
+            # 5. Robust cleanup when toggled off
+            self.viewer.toggle_MER()
+            if self.table_dialog:
+                self.table_dialog.close()
+                self.table_dialog = None
+            self.update_status("MER catalog hidden.")
+
+
+    def reset_ui_state(self):
+        """Clears all overlays and dialogs when a new image is loaded."""
+        self.set_black_squares()
+        self.coord_list.clear()
+        
+        if self.table_dialog:
+            self.table_dialog.close()
+            self.table_dialog = None
+            
+        if self.plot_dialog:
+            self.plot_dialog.close()
+            self.plot_dialog = None
+            
+        # Ensure buttons reflect the new empty state
+        self.MER_PushButton.setChecked(False)
+        self.plotPushButton.setChecked(False)
+        self.submit_targets_button.setEnabled(False)
+        self.save_targets_button.setEnabled(False)
 
     def select_table_row(self, object_id):
         if self.table_dialog:
             self.table_dialog.select_row_by_object_id(object_id)
 
-    def on_photoLargePushButton_clicked(self):
-        if self.viewer:
-            self.viewer.save_full_image_with_overlays()
-
-    def on_photoMediumPushButton_clicked(self):
-        if self.viewer:
-            self.viewer.save_visible_area_with_overlays()
-
-    def on_photoSmallPushButton_clicked(self):
+    def photoPushButton_requested(self):
         if self.viewer:
             self.viewer.start_selection()
+        self.photoPushButton.setChecked(False)
 

@@ -1,6 +1,9 @@
 import os
 import re
+import warnings
+import gc
 from astropy.table import Table
+from astropy.io import fits
 from PyQt5.QtWidgets import QGraphicsEllipseItem
 from PyQt5.QtGui import QPen, QColor
 from PyQt5.QtCore import QRectF
@@ -9,13 +12,13 @@ import astropy.units as u
 import numpy as np
 
 
-# Define NA as a recognized unit so the parser doesn't complain
+# Define the unit locally if it doesn't exist
 try:
-    # Try the version 5.x/6.x way
-    u.def_unit('NA', u.dimensionless_unscaled, register_to_subclass=True)
-except (TypeError, ValueError):
-    # Fallback for Astropy < 5.0 OR Astropy >= 7.0
-    u.def_unit('NA', u.dimensionless_unscaled)
+    # We define it but don't need register_to_subclass=True for simple reading
+    NA_UNIT = u.def_unit('NA', u.dimensionless_unscaled)
+except ValueError:
+    # If already defined (e.g., during a re-import), grab the existing one
+    NA_UNIT = u.Unit('NA')
 
 
 class CatalogManager:
@@ -44,21 +47,47 @@ class CatalogManager:
         
     def load_catalog(self):
         """
-        Search for and load the FITS table with the matching tile_id and 'EUC_MER_FINAL-CAT' in the filename.
+        Search for and load the FITS table with the matching tile_id.
         """
+
+        # Clear an old catalog immediately to free up memory 
+        # before starting the new search and load process.
+        self.catalog = None
+        gc.collect()
+        
         try:
+            # Ensure the custom unit is defined
+            try:
+                na_unit = u.Unit('NA')
+            except ValueError:
+                na_unit = u.def_unit('NA', u.dimensionless_unscaled)
+
+            if not os.path.isdir(self.search_dir): return
+            
             for filename in os.listdir(self.search_dir):
                 if (
-                        self.tileID in filename and
-                        'EUC_MER_FINAL-CAT' in filename and
-                        filename.lower().endswith(('.fits'))
+                    self.tileID in filename and
+                    'EUC_MER_FINAL-CAT' in filename and
+                    filename.lower().endswith('.fits')
                 ):
-                    if filename.endswith(".fits"):
-                        self.catalog_name = filename[:-5]+"\n"
+                    self.catalog_name = filename[:-5] + "\n"
                     filepath = os.path.join(self.search_dir, filename)
-                    self.catalog = Table.read(filepath, format='fits')
-                    self.catalog_path = self.search_dir
 
+                    # Wrap the read in a warning filter and enabled units context
+                    with u.add_enabled_units([na_unit]), warnings.catch_warnings():
+                        warnings.simplefilter('ignore', category=u.UnitsWarning)
+                        warnings.simplefilter('ignore', category=fits.verify.VerifyWarning)
+                        
+                        self.catalog = Table.read(filepath, format='fits')
+
+                        # Optional: Force columns to stay in their native format if they were read as objects
+                        for col in self.catalog.colnames:
+                            if self.catalog[col].dtype == np.float64:
+                                # Only keep as float64 if the FITS file explicitly used Double Precision (D)
+                                # Otherwise, ensure we aren't upcasting single-precision (E) columns.
+                                pass 
+
+                    self.catalog_path = self.search_dir
                     self.delete_empty_columns()
                     self.compute_magnitudes()
                     
@@ -66,20 +95,14 @@ class CatalogManager:
                         self.image_viewer.update_status(f"Loaded MER catalog: {filename}", 3000)
                     return
                 
-            # If loop completes without finding a match
-            raise FileNotFoundError(f"MER catalog not present for {self.tileID} in {self.search_dir}. Catalog overlay not possible.")
-    
-        except FileNotFoundError as e:
-#            print(f"Error loading MER catalog: {e}")
-            if self.image_viewer:
-                self.image_viewer.update_status(str(e), 10000)
-                print(f"{e}")
-            self.catalog = None
+            raise FileNotFoundError(f"MER catalog not present for {self.tileID}")
+
         except Exception as e:
-#            print(f"Error loading MER catalog: {e}")
             if self.image_viewer:
                 self.image_viewer.update_status(f"Error loading catalog: {e}", 10000)
-                print(f"Error loading MER catalog: {e}")
+#            print(f"Error loading MER catalog: {e}")
+            else:
+                print(f"INFO: {e}")
             self.catalog = None
 
     def get_catalog_row_count(self):
@@ -220,81 +243,31 @@ class CatalogManager:
         
     def handle_selected_objects(self, object_ids):
         """
-        Slot to handle lasso-selected OBJECT_IDs from PlotDialog.
-        Plots yellow ellipses for selected objects and centers the view.
-        
-        Args:
-            object_ids (list): List of selected OBJECT_IDs.
+        Bridge method called by the plotter. 
+        It tells the viewer to display these specific IDs.
         """
+        if self.image_viewer:
+            self.image_viewer.display_selected_MER(object_ids)
 
-        # Get image_height from image_viewer.original_image
-        try:
-            image_height = self.image_viewer.original_image.shape[0]
-        except AttributeError:
-            print("Error: original_image not found in image_viewer or invalid shape")
-            if self.image_viewer:
-                self.image_viewer.update_status("Please load an image first", 5000)
-            return
-
-        # Get selected MER ellipses
-        self.get_selected_MER(object_ids, image_height)
-
-        # Add items to the QGraphicsScene and store them
-        self.image_viewer.show_selected_MER()
-
-                
+            
     def get_selected_MER(self, selected_object_ids, image_height):
         """
-        Extract source parameters and create yellow MER ellipse items for selected OBJECT_IDs.
-        Centers the QGraphicsView on the first selected object.
-        
-        Args:
-            selected_object_ids (list): List of OBJECT_IDs to plot.
-            image_height (int): Image height in pixels for TIFF y-coordinate flip.
-        
-        Returns:
-            list: List of QGraphicsEllipseItem objects for selected objects.
+        Extract parameters and create items for selected IDs.
+        Does NOT add them to the scene; returns them for the viewer to handle.
         """
-        if not self.catalog:
-            print("No MER catalog available for plotting")
-            if self.image_viewer:
-                self.image_viewer.update_status("No MER catalog available", 5000)
-            return []
-        
-        if not self.wcs:
-            print("No WCS; cannot overlay MER catalog")
-            if self.image_viewer:
-                self.image_viewer.update_status("No WCS available", 5000)
-            return []
-        
-        if not selected_object_ids:
-            print("No selected OBJECT_IDs provided")
-            if self.image_viewer:
-                self.image_viewer.update_status("No objects selected", 2000)
+        if not self.catalog or not self.wcs or not selected_object_ids:
             return []
 
-        # Clear previous selection
-        self.clear_selected_MER()
+        # Clear existing selection references
+        self.selected_MER_items = []
+        
         try:
-            # Extract required columns
-            required_columns = [
-                'OBJECT_ID', 'RIGHT_ASCENSION', 'DECLINATION',
-                'SEMIMAJOR_AXIS', 'POSITION_ANGLE', 'ELLIPTICITY'
-            ]
-            for col in required_columns:
-                if col not in self.catalog.colnames:
-                    raise KeyError(f"Column {col} missing in FITS table")
-
-            # Filter catalog for selected OBJECT_IDs
+            # Filter catalog for selected IDs
             mask = np.isin(self.catalog['OBJECT_ID'].data, selected_object_ids)
             if not np.any(mask):
-                print("No matching OBJECT_IDs found in catalog")
-                if self.image_viewer:
-                    self.image_viewer.update_status("No matching objects found", 2000)
                 return []
+            
             selected_catalog = self.catalog[mask]
-
-            # Extract RA, Dec, and other parameters
             ra = np.array(selected_catalog['RIGHT_ASCENSION'].data, dtype=float)
             dec = np.array(selected_catalog['DECLINATION'].data, dtype=float)
             a = selected_catalog['SEMIMAJOR_AXIS'].data
@@ -302,45 +275,40 @@ class CatalogManager:
             pa = selected_catalog['POSITION_ANGLE'].data
             object_ids = selected_catalog['OBJECT_ID'].data
 
-            # Create SkyCoord for coordinates
             sky_coords = SkyCoord(ra=ra, dec=dec, unit='deg', frame='icrs')
-
-            # Convert RA/Dec to pixel coordinates
             x, y = self.wcs.world_to_pixel(sky_coords)
-            y = image_height - y  # Flip y-axis
+            y = image_height - y 
 
-            # Compute semi-minor axis: B = A * (1 - E)
-            a = 3 * a  # Rescale as in get_MER
-            b = a * (1 - e)
+            a_scaled = 3 * a 
+            b_scaled = a_scaled * (1 - e)
 
-            # Create yellow ellipse items
             for i in range(len(x)):
-                ellipse = self.make_ellipse(x[i], y[i], a[i], b[i], pa[i], QColor(255, 255, 0), 1, object_ids[i])
+                ellipse = self.make_ellipse(x[i], y[i], a_scaled[i], b_scaled[i], pa[i], QColor(255, 255, 0), 1, object_ids[i])
                 self.selected_MER_items.append(ellipse)
 
-            # Center QGraphicsView on the first selected object
+            # Center on first object
             if len(x) > 0:
-                first_x, first_y = x[0], y[0]
-                self.image_viewer.centerOn(first_x, first_y)
-                self.image_viewer.update_status(f"Plotted {len(x)} selected sources in yellow, centered on OBJECT_ID {object_ids[0]}", 3000)
-
+                self.image_viewer.centerOn(x[0], y[0])
+            
+            return self.selected_MER_items
 
         except Exception as e:
-            print(f"Error processing selected MER catalog: {e}")
-            if self.image_viewer:
-                self.image_viewer.update_status(f"Error processing selected MER: {e}", 5000)
+            print(f"Error in get_selected_MER: {e}")
+            return []
+
 
     # Currently unused
     def clear_MER(self):
         """
         Clear the list of MER items.
         """
-        self.image_viewer.hide_MER()
+        self.image_viewer.clear_MER()
         self.MER_items = []
 
     def clear_selected_MER(self):
-        """
-        Clear the list of selected MER items.
-        """
-        self.image_viewer.hide_selected_MER()
-        self.selected_MER_items = []
+        """Wipes the selection data and tells viewer to clean the scene."""
+        if self.image_viewer:
+            self.image_viewer.clear_selected_MER()
+        else:
+            self.selected_MER_items = []
+

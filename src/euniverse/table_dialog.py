@@ -1,3 +1,4 @@
+import os
 from PyQt5.QtWidgets import QDialog, QAbstractItemView, QTableView, QVBoxLayout, QHeaderView, QGraphicsEllipseItem, QGraphicsView 
 from PyQt5.QtCore import Qt, QAbstractTableModel, QModelIndex, QPointF
 from PyQt5.QtGui import QColor, QPen
@@ -16,6 +17,25 @@ class CatalogTableModel(QAbstractTableModel):
         self.required_columns = required_columns
         self.columns = self._get_visible_columns()
         self.data_types = self._get_column_data_types()
+
+    def sort(self, column, order):
+        """Sort table by a column index."""
+        if self.catalog is None or len(self.catalog) == 0:
+            return
+
+        # Notify the view that the layout is about to change
+        self.layoutAboutToBeChanged.emit()
+
+        # Get the name of the column to sort by
+        col_name = self.columns[column]
+        
+        # Astropy tables can be sorted in-place
+        # order == 0 is Ascending, order == 1 is Descending
+        reverse = (order == Qt.DescendingOrder)
+        self.catalog.sort(col_name, reverse=reverse)
+
+        # Notify the view that the layout has changed
+        self.layoutChanged.emit()
 
     def _get_visible_columns(self):
         """
@@ -60,19 +80,31 @@ class CatalogTableModel(QAbstractTableModel):
         value = self.catalog[row][col_name]
 
         if role == Qt.DisplayRole:
-            if isinstance(value, MaskedColumn):
-                return str(value.data[0])  # Or handle masked values as needed
-            else:
-                # Preserve original formatting!
-                return str(value)
+            # Handle Masked Values
+            if hasattr(value, 'mask') and value.mask:
+                return "" # Or "NaN" / "null" depending on preference
+
+            # Maintain Numeric Precision for Floats
+            if isinstance(value, (np.float32, np.float64)):
+                # trim=None ensures we don't truncate necessary precision
+                # positional=True avoids scientific notation unless necessary
+                return np.format_float_positional(value, trim='-') 
+            
+            # Fallback for integers and strings
+            return str(value)
+
         elif role == Qt.TextAlignmentRole:
-            if np.issubdtype(self.data_types[col_name], np.number):
-                return Qt.AlignRight
-            return Qt.AlignLeft
+            # Ensure we are checking the native numpy dtype to align columns
+            if np.issubdtype(self.catalog[col_name].dtype, np.number):
+                return Qt.AlignRight | Qt.AlignVCenter
+            return Qt.AlignLeft | Qt.AlignVCenter
+
         elif role == Qt.BackgroundRole:
             if row % 2 == 0:
-                return QColor(240, 240, 240)  # Light gray background on even rows
+                return QColor(240, 240, 240)
+        
         return None
+
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if orientation == Qt.Horizontal and role == Qt.DisplayRole:
@@ -81,17 +113,126 @@ class CatalogTableModel(QAbstractTableModel):
 
 
 class TableDialog(QDialog):
-    def __init__(self, catalog, viewer, parent=None):
+    def __init__(self, catalog, viewer, catalog_name=None, parent=None):
         super().__init__(parent)
+        # Determine window title based on filename
+
+        if catalog_name:
+            self.setWindowTitle(f"{catalog_name}")
+        else:
+            self.setWindowTitle("Catalog Table")
+
         self.catalog = catalog
         self.viewer = viewer
-        self.setWindowTitle("FITS Table Viewer")
+
+        # Initial sizing
+        self.resize(1000, 400)
+
+        self.table_view = QTableView()
+
+        # --- Enable sorting ---
+        self.table_view.setSortingEnabled(True)
+        
+        # The subset of columns to display
         self.required_columns = [
             'OBJECT_ID', 'RIGHT_ASCENSION', 'DECLINATION', 'MAG_VIS_PSF',
-            'MAG_Y_TEMPLFIT', 'MAG_J_TEMPLFIT', 'MAG_H_TEMPLFIT', 'FWHM'
-        ]  # Define required columns here
-        self.init_ui()
+            'MAG_Y_TEMPLFIT', 'MAG_J_TEMPLFIT', 'MAG_H_TEMPLFIT', 'FWHM', 'KRON_RADIUS'
+        ]
+        
+        self.table_model = CatalogTableModel(catalog, required_columns=self.required_columns)
+        self.table_view.setModel(self.table_model)
+
+        # --- PERFORMANCE OPTIMIZATIONS ---
+        header = self.table_view.horizontalHeader()
+        
+        # 1. Fit columns to content once
+        self.table_view.resizeColumnsToContents()
+        
+        # 2. Switch to Interactive mode to freeze widths
+        header.setSectionResizeMode(QHeaderView.Interactive) 
+        header.setStretchLastSection(False) 
+
+        # 3. Optimize Vertical Header (Row heights)
+        v_header = self.table_view.verticalHeader()
+        v_header.setDefaultSectionSize(25)
+        v_header.setSectionResizeMode(QHeaderView.Fixed)
+
+        # 4. General View Settings
+        self.table_view.setWordWrap(False)
+        self.table_view.setAlternatingRowColors(True)
+        self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table_view.setSelectionMode(QAbstractItemView.SingleSelection)
+
+        # Connect signals
+        self.table_view.clicked.connect(self.on_row_selected)
+
+        # Create layout (keeping default margins)
+        layout = QVBoxLayout()
+        layout.addWidget(self.table_view)
+        self.setLayout(layout)
+
+        # --- DYNAMIC WIDTH CALCULATION ---
+        # We need to process events to ensure the headers and scrollbars have 
+        # calculated their own sizes before we ask for them.
+        self.table_view.horizontalHeader().setMinimumSectionSize(0)
+        
+        # Calculate sum of all column widths
+        content_width = 0
+        for i in range(len(self.required_columns)):
+            content_width += self.table_view.columnWidth(i)
+        
+        # Add width of the vertical header (the row index column)
+        content_width += v_header.width()
+        
+        # Add width of the vertical scrollbar
+        content_width += self.table_view.verticalScrollBar().sizeHint().width()
+        
+        # Add the frame width of the QTableView itself (left + right borders)
+        content_width += self.table_view.frameWidth() * 2
+        
+        # Add the layout margins (left + right)
+        margins = layout.contentsMargins()
+        total_width = content_width + margins.left() + margins.right()
+
+        # Resize the dialog to the exact content width
+        self.resize(total_width, 400)
+
         self.selected_row = None
+
+
+    def on_row_selected(self, index):
+        """
+        Handles row selection: highlights the object in the viewer and centers it.
+        """
+        if not index.isValid() or self.catalog is None or self.viewer is None:
+            return
+
+        self.selected_row = index.row()
+        # Retrieve the OBJECT_ID from the actual catalog data using the row index
+        object_id = self.catalog['OBJECT_ID'][index.row()]
+
+        # Iterate through scene items to find the matching QGraphicsEllipseItem
+        for item in self.viewer.scene.items():
+            if isinstance(item, QGraphicsEllipseItem) and item.data(0) == object_id:
+                # Highlight the selected ellipse in yellow
+                pen = QPen(QColor(255, 255, 0), 1.5)
+                item.setPen(pen)
+
+                # Center the ImageViewer on this object
+                rect = item.rect()
+                center_scene = item.mapToScene(rect.center())
+                self.viewer.centerOn(center_scene)
+                
+                # Reset cursor state for the viewport
+                self.viewer.setDragMode(QGraphicsView.NoDrag)
+                self.viewer.viewport().setCursor(Qt.ArrowCursor)
+            
+            elif isinstance(item, QGraphicsEllipseItem):
+                # Reset other ellipses to red
+                pen = QPen(QColor(255, 0, 0), 1.0)
+                item.setPen(pen)
+
+        self.viewer.scene.update()
 
     def init_ui(self):
         layout = QVBoxLayout()

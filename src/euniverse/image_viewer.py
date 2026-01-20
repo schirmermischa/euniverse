@@ -5,6 +5,7 @@ import tifffile
 import json
 import os
 import re
+import gc
 import numpy as np
 from PIL import Image
 from scipy.ndimage import zoom
@@ -31,6 +32,7 @@ class ImageViewer(QGraphicsView):
         super().__init__()
         self.main_window = main_window
         self.scene = QGraphicsScene()
+        self.scene.setItemIndexMethod(QGraphicsScene.BspTreeIndex) # for quicker display of graphics items (identifies objects that are currently visible in the shown area)
         self.setScene(self.scene)
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
@@ -52,18 +54,21 @@ class ImageViewer(QGraphicsView):
         self.scale_factor = 1.0
         self.last_pixmap = None
         self.last_preview_pixmap = None
-        self.press_pos = QPoint()
-        self.release_pos = QPoint()
-        self.dragging = False
+        self.start_point_screen = QPoint()
+        self.end_point_screen = QPoint()
         self.catalog_manager = None
         self.is_displaying_preview = False
         self.is_preview_updated = False
         # Measurement attributes
         self.is_measuring = False
-        self.measure_start = None
-        self.measure_end = None
+        self.measuring_line = None
+        self.measuring_line_h = None
+        self.measuring_line_v = None
+        self.start_point = None
+        self.end_point = None
+        self.current_point = None
+        self.rubber_band = None
         self.start_ra_dec = None
-        self.end_ra_dec = None
         self.angular_offset = None
         self.offset_unit = None
         self.horizontal_offset = None
@@ -89,8 +94,6 @@ class ImageViewer(QGraphicsView):
         self.contrast_luts8 = {}  # Cache for LUTs
         self.rectangle_selection = False
         self.rubber_band = None
-        self.start_point = None
-        self.end_point = None
         self.selection_rect = None
         self.callback_on_selection = None
         QApplication.setOverrideCursor(Qt.ArrowCursor)
@@ -187,14 +190,28 @@ class ImageViewer(QGraphicsView):
 
 
     def reset(self):
-        # Clear the catalogs
-        self.control_dock.coord_list.clear()
-        self.hide_MER()
+        # 1. Clear UI components
+        if self.control_dock:
+            self.control_dock.coord_list.clear()
+            self.control_dock.set_black_squares()
+        
+        # 2. Clear visual overlays
+        self.clear_MER()
+        self.image_item = None
+        
+        # 3. Explicit Memory Cleanup
+        if self.catalog_manager:
+            self.catalog_manager.catalog = None # Release the large table data
         self.catalog_manager = None
-        self.control_dock.MER_PushButton.setChecked(False)
 
-        # Clear the windows
-        self.control_dock.set_black_squares()
+        # 4. Further clearing
+        self.clear_measuring_state()
+        
+        if self.original_image is not None:
+            self.original_image = None # Release the large image array
+            
+        self.scene.clear() # Clear everything from the scene
+        gc.collect()
             
 
     def load_image(self, path):
@@ -302,49 +319,90 @@ class ImageViewer(QGraphicsView):
     ###############################################
     # MER catalog display
     ###############################################
-    def show_MER(self):
-        if self.catalog_manager is None:
-            print("No MER catalog available")
+    def toggle_MER(self):
+        if self.catalog_manager is None or self.original_image is None:
             return
-        if self.original_image is None:
-            print("No image loaded for MER catalog overlay")
+
+        # Case A: List is empty - Load from scratch
+        if not self.catalog_manager.MER_items:
+            self.catalog_manager.get_MER(self.original_image.shape[0])
+            self.setUpdatesEnabled(False)
+            try:
+                for ellipse in self.catalog_manager.MER_items:
+                    self.scene.addItem(ellipse)
+                    ellipse.setVisible(True)
+            finally:
+                self.setUpdatesEnabled(True)
+                self.scene.update()
             return
-        # Clear previous display
-        self.hide_MER()
-        self.catalog_manager.get_MER(self.original_image.shape[0])
+
+        # Case B: List exists - Flip the visibility
+        # Check the first item to see if we are currently hiding or showing
+        is_now_visible = not self.catalog_manager.MER_items[0].isVisible()
+    
         for ellipse in self.catalog_manager.MER_items:
-            self.scene.addItem(ellipse)
+            ellipse.setVisible(is_now_visible)
+    
         self.scene.update()
 
-    def hide_MER(self):
+    def clear_MER(self):
+        """Permanently removes MER items so the list is empty again."""
         if self.catalog_manager and self.catalog_manager.MER_items:
             for ellipse in self.catalog_manager.MER_items:
                 if ellipse.scene() == self.scene:
                     self.scene.removeItem(ellipse)
-                #        self.catalog_manager.MER_items = []
+        
+            # This ensures 'if not self.catalog_manager.MER_items' returns True next time
+            self.catalog_manager.MER_items = []
             self.scene.update()
 
-    def show_selected_MER(self):
-        if self.catalog_manager is None:
-            print("No MER catalog available")
-            return
-        if self.original_image is None:
-            print("No image loaded for MER catalog overlay")
-            return
-        # Clear previous display
-        self.hide_selected_MER()
-        if self.catalog_manager.selected_MER_items:
-            for ellipse in self.catalog_manager.selected_MER_items:
-                self.scene.addItem(ellipse)
-            self.scene.update()
 
-    def hide_selected_MER(self):
+    def display_selected_MER(self, object_ids):
+        """Standardized method for Plotter/Lasso input."""
+        if not self.catalog_manager or self.original_image is None:
+            return
+
+        # Always clear old overlays first
+        self.clear_selected_MER()
+
+        # Generate new shapes (CatalogManager returns the items and stores them)
+        image_height = self.original_image.shape[0]
+        new_items = self.catalog_manager.get_selected_MER(object_ids, image_height)
+
+        if new_items:
+            self.setUpdatesEnabled(False)
+            try:
+                for item in new_items:
+                    self.scene.addItem(item)
+                    item.setVisible(True)
+                
+                # Center view on the first object of the selection
+                self.centerOn(new_items[0].rect().center())
+            finally:
+                self.setUpdatesEnabled(True)
+                self.scene.update()
+
+    def clear_selected_MER(self):
+        """Cleanly removes selected ellipses from the scene."""
         if self.catalog_manager and self.catalog_manager.selected_MER_items:
-            for ellipse in self.catalog_manager.selected_MER_items:
-                if ellipse.scene() == self.scene:
-                    self.scene.removeItem(ellipse)
-                #        self.catalog_manager.MER_items = []
+            for item in self.catalog_manager.selected_MER_items:
+                if item.scene() == self.scene:
+                    self.scene.removeItem(item)
+            # Clear the list in the manager
+            self.catalog_manager.selected_MER_items = []
             self.scene.update()
+
+    def toggle_selected_MER(self):
+        """Toggles visibility of existing selection without re-fetching data."""
+        items = getattr(self.catalog_manager, 'selected_MER_items', [])
+        if not items:
+            return
+
+        new_vis = not items[0].isVisible()
+        for item in items:
+            item.setVisible(new_vis)
+        self.scene.update()
+
 
     ###############################################
     # Process image
@@ -557,33 +615,38 @@ class ImageViewer(QGraphicsView):
     # Event handling
     ############################################################
     def mousePressEvent(self, event):
-        # If screenshotting a sub-area
-        if self.rectangle_selection:
-            if self.start_point is None and self.callback_on_selection:
-                self.start_point = self.mapToScene(event.pos())
-                self.rubber_band = QGraphicsRectItem(QRectF(self.start_point, QPointF()))
-                pen = QPen(QColor("white"), 1, Qt.DashLine)
-                self.rubber_band.setPen(pen)
-                self.scene.addItem(self.rubber_band)
-                # Create crosshair; don't add it yet (done in mousemove event)
-                self.crosshair = self.create_crosshair(self.rubber_band)
-            else:
-                super().mousePressEvent(event)
-            return
-
         scene_pos = self.mapToScene(event.pos())
-        # Left button: 
+        self.start_point = scene_pos
+        
+        # Calculate WCS of click position and store it for MouseMoveEvent
+        if self.wcs and self.original_image is not None:
+            flipped_y = self.original_image.shape[0] - scene_pos.y()
+            self.start_ra_dec = self.wcs.pixel_to_world(scene_pos.x(), flipped_y)
+ 
+        # 1. Screenshotting a sub-area
+        if self.rectangle_selection:
+            self.rubber_band = QGraphicsRectItem(QRectF(self.start_point, QPointF()))
+            pen = QPen(QColor("white"), 1, Qt.DashLine)
+            self.rubber_band.setPen(pen)
+            self.scene.addItem(self.rubber_band)
+            # Create crosshair; don't add it yet (done in mousemove event)
+            self.crosshair = self.create_crosshair(self.rubber_band)
+            return   # Early exit; also: don't let PyQt interpret the event further in super()
+
+        # 2. Left button logic
         if event.button() == Qt.LeftButton:
-            self.dragging = True
-            self.press_pos = event.pos()  # Store press position for click detection
+            self.start_point_screen = event.pos()  # Store press position for click detection
+
+        # 3. Middle button logic
         elif event.button() == Qt.MidButton:
             self.is_measuring = True
-            self.measure_start = scene_pos
             self.setDragMode(QGraphicsView.NoDrag)
             self.viewport().update()
+            return 
+
+        # 4. Right button logic
         elif event.button() == Qt.RightButton:
-            # Check if right-click is on an existing circle
-            self.dragging = False
+            # Check if click is on an existing circle and if so, remove that circle
             for circle, ra, dec, classifier, normal_thickness in self.circles[:]:
                 circle_rect = circle.rect()
                 circle_center = circle_rect.center()
@@ -597,39 +660,43 @@ class ImageViewer(QGraphicsView):
                             self.control_dock.selected_circle = None
                     self.viewport().update()
                     return
+
             # Show context menu
             menu = QMenu(self)
-            gl_arc = menu.addAction("GL: lens")
+            gl_lens = menu.addAction("GL: lens")
             gl_arc = menu.addAction("GL: arc")
             gl_multi = menu.addAction("GL: multiple image")
-            gl_lens = menu.addAction("GL: strong lens")
             gl_einstein = menu.addAction("GL: Einstein ring")
-            gl_einstein = menu.addAction("GL: DSLP")
+            gl_dspl = menu.addAction("GL: DSPL")
             menu.addSeparator()
+            agn_seyfert = menu.addAction("AGN: Seyfert 1")
             agn_outflow = menu.addAction("AGN: outflow")
             menu.addSeparator()
+            gx_emline = menu.addAction("Gx: Emissionline")
             gx_ring = menu.addAction("Gx: Ring")
             gx_polar = menu.addAction("Gx: Polar ring")
             gx_stream = menu.addAction("Gx: Stream")
             gx_merger = menu.addAction("Gx: Merger")
             gx_irregular = menu.addAction("Gx: Irregular")
-            gx_weird = menu.addAction("Gx: Dwarf")
+            gx_dwarf = menu.addAction("Gx: Dwarf")
             gx_weird = menu.addAction("Gx: weird")
+            gl_lens.setData({"gl": True})
             gl_arc.setData({"gl": True})
             gl_multi.setData({"gl": True})
-            gl_lens.setData({"gl": True})
             gl_einstein.setData({"gl": True})
+            gl_dspl.setData({"gl": True})
+            agn_seyfert.setData({"agn": True})
             agn_outflow.setData({"agn": True})
+            gx_emline.setData({"gx": True})
             gx_ring.setData({"gx": True})
             gx_polar.setData({"gx": True})
             gx_stream.setData({"gx": True})
             gx_merger.setData({"gx": True})
             gx_irregular.setData({"gx": True})
+            gx_dwarf.setData({"gx": True})
             gx_weird.setData({"gx": True})
             action = menu.exec_(self.mapToGlobal(event.pos()))
             if action and self.wcs and self.original_image is not None:
-                flipped_y = self.original_image.shape[0] - scene_pos.y()
-                ra, dec = self.wcs.pixel_to_world(scene_pos.x(), flipped_y)
                 classifier = action.text()
                 if classifier.startswith("GL"):
                     color = QColor(0, 200, 255)  # Bright blue
@@ -642,39 +709,59 @@ class ImageViewer(QGraphicsView):
                 circle.setPen(QPen(color, normal_thickness))
                 circle.setZValue(10)
                 self.scene.addItem(circle)
-                self.circles.append((circle, ra, dec, classifier, normal_thickness))
+                self.circles.append((circle, self.start_ra_dec[0], self.start_ra_dec[1], classifier, normal_thickness))
                 if self.control_dock:
                     self.control_dock.update_coord_list(self.circles)
                 self.viewport().update()
+
+        # let PyQt interpret the event further
         super().mousePressEvent(event)
 
-    def mouseMoveEvent(self, event):
-        # If screenshotting a sub-area
-        if self.rectangle_selection:
-            if self.start_point and self.rubber_band:
-                self.end_point = self.mapToScene(event.pos())
-                rect = QRectF(self.start_point, self.end_point).normalized()
-                self.rubber_band.setRect(rect)
-                if self.crosshair is not None:
-                    self.crosshair.setPos(rect.center())
-                    ch_x = rect.center().x()
-                    ch_y = self.original_image.shape[0] - rect.center().y()
-                    self.crosshair_ra, self.crosshair_dec = self.wcs.pixel_to_world(ch_x, ch_y)
-            else:
-                super().mouseMoveEvent(event)
-            return
         
-        scene_pos = self.mapToScene(event.pos())
+    def mouseMoveEvent(self, event):
+        """
+        Complete mouse tracking routine. Corrected to use 'is_measuring' 
+        to match the ImageViewer class attributes.
+        """
+        super().mouseMoveEvent(event)
+
+        if not self.wcs or not self.control_dock or self.original_image is None:
+            return
+
+        # Setup
+        self.current_point = self.mapToScene(event.pos())    # also used in the virtual hook drawForeground()
+        flipped_y =  self.original_image.shape[0] - self.current_point.y()      # FITS is flipped in vertical direction
+        ra, dec = None, None  # in case pointer is outside image area
+        
+        # Magnifier always follows the mouse
+        self.control_dock.update_magnifier(self.current_point)
+
+        # Coordinate tracking
+        if self.sceneRect().contains(self.current_point):
+            try:
+                ra, dec = self.wcs.pixel_to_world(self.current_point.x(), flipped_y)
+                self.control_dock.update_cursor_display(self.current_point.x(), flipped_y, ra, dec)
+            except: pass
+        else:
+            self.control_dock.update_cursor_display(None, None, None, None)
+
+        # If screenshotting a sub-area
+        if self.rectangle_selection and self.rubber_band:
+            rect = QRectF(self.start_point, self.current_point).normalized()   # normalized() removes negative signs
+            self.rubber_band.setRect(rect)
+            if self.crosshair and self.crosshair.scene():
+                self.crosshair.setPos(rect.center())
+                ch_x = rect.center().x()
+                ch_y = self.original_image.shape[0] - rect.center().y()
+                self.crosshair_ra, self.crosshair_dec = self.wcs.pixel_to_world(ch_x, ch_y) # remember for later use in save_area_selection
+            return
+
+        # 3. MEASURING LOGIC
         # Measuring distances in image (middle-mouse-button drag)
-        if self.is_measuring:
-            self.measure_end = scene_pos
-            if self.wcs and self.original_image is not None:
-                flipped_y_start = self.original_image.shape[0] - self.measure_start.y()
-                flipped_y_end = self.original_image.shape[0] - self.measure_end.y()
-                self.start_ra_dec = self.wcs.pixel_to_world(self.measure_start.x(), flipped_y_start)
-                self.end_ra_dec = self.wcs.pixel_to_world(self.measure_end.x(), flipped_y_end)
+        if self.is_measuring and self.start_point and ra is not None and dec is not None:
+            try:
                 start_coord = SkyCoord(self.start_ra_dec[0] * u.deg, self.start_ra_dec[1] * u.deg, frame='icrs')
-                end_coord = SkyCoord(self.end_ra_dec[0] * u.deg, self.end_ra_dec[1] * u.deg, frame='icrs')
+                end_coord = SkyCoord(ra * u.deg, dec * u.deg, frame='icrs')
                 angular_offset_deg = start_coord.separation(end_coord).to(u.deg).value
                 if angular_offset_deg * 3600 < 60:
                     self.angular_offset = angular_offset_deg * 3600
@@ -685,7 +772,7 @@ class ImageViewer(QGraphicsView):
                 else:
                     self.angular_offset = None
                     self.offset_unit = None
-                horizontal_coord = SkyCoord(self.end_ra_dec[0] * u.deg, self.start_ra_dec[1] * u.deg, frame='icrs')
+                horizontal_coord = SkyCoord(ra * u.deg, self.start_ra_dec[1] * u.deg, frame='icrs')
                 horizontal_offset_deg = start_coord.separation(horizontal_coord).to(u.deg).value
                 if horizontal_offset_deg * 3600 < 60:
                     self.horizontal_offset = horizontal_offset_deg * 3600
@@ -696,7 +783,7 @@ class ImageViewer(QGraphicsView):
                 else:
                     self.horizontal_offset = None
                     self.horizontal_unit = None
-                vertical_coord = SkyCoord(self.start_ra_dec[0] * u.deg, self.end_ra_dec[1] * u.deg, frame='icrs')
+                vertical_coord = SkyCoord(self.start_ra_dec[0] * u.deg, dec * u.deg, frame='icrs')
                 vertical_offset_deg = start_coord.separation(vertical_coord).to(u.deg).value
                 if vertical_offset_deg * 3600 < 60:
                     self.vertical_offset = vertical_offset_deg * 3600
@@ -707,109 +794,138 @@ class ImageViewer(QGraphicsView):
                 else:
                     self.vertical_offset = None
                     self.vertical_unit = None
+            except Exception: pass
             self.viewport().update()
-        # Update cursor coordinates display
-        if self.wcs and self.control_dock and self.original_image is not None:
-            flipped_y = self.original_image.shape[0] - scene_pos.y()
-            ra, dec = self.wcs.pixel_to_world(scene_pos.x(), flipped_y)
-            self.control_dock.update_cursor_display(scene_pos.x(), flipped_y, ra, dec)
-        super().mouseMoveEvent(event)
-        if self.control_dock:
-            self.control_dock.update_magnifier(scene_pos)
+
 
     def mouseReleaseEvent(self, event):
-        # If screenshotting a sub-area
-        if self.rectangle_selection:
-            if self.start_point and self.end_point and self.callback_on_selection:
-                self.selection_rect = QRectF(self.start_point, self.end_point).normalized()
-                self.scene.removeItem(self.rubber_band)
-                self.rubber_band = None
-                self.setCursor(Qt.ArrowCursor)
-                if self.callback_on_selection:
-                    self.callback_on_selection(self.selection_rect)
-                    self.callback_on_selection = None
-                self.start_point = None
-                self.end_point = None
-            else:
-                super().mouseReleaseEvent(event)
-            return
-
         scene_pos = self.mapToScene(event.pos())
-        self.dragging = False
+        self.end_point = scene_pos     # needed outside
+        self.end_point_screen = event.pos()
+        
+        # 1. Handle Selection Tool first (Early Exit)
+        if self.rectangle_selection:
+            self.handle_screenshot_release(event)
+            return # Exit early: don't process clicks or middle-button logic
+
+        # 2. Left Button Logic
         if event.button() == Qt.LeftButton:
-            self.release_pos = event.pos()
-            # Determine if this was a click (small movement) or a drag
-            was_click = (abs(self.press_pos.x() - self.release_pos.x()) < 5 and
-                         abs(self.press_pos.y() - self.release_pos.y()) < 5)
-
+            was_click = (self.end_point_screen - self.start_point_screen).manhattanLength() < 5
             if was_click:
-                # Check for ellipse click
-                for ellipse in self.catalog_manager.MER_items:
-                    rect = ellipse.rect()
-                    center = rect.center()
-                    distance = ((scene_pos.x() - center.x())**2 + (scene_pos.y() - center.y())**2)**0.5
-                    if distance <= 10:
-                        object_id = ellipse.data(0)
-                        if object_id is not None and self.control_dock:
-                            self.control_dock.select_table_row(object_id)
-                            # Highlight the ellipse with yellow color and 1.5x thickness
-                            pen = QPen(QColor(255, 255, 0), 1.5)  # Yellow
-                            ellipse.setPen(pen)
-                            # Reset other ellipses to red
-                            for other_ellipse in self.catalog_manager.MER_items:
-                                if other_ellipse != ellipse:
-                                    other_pen = QPen(QColor(255, 0, 0), 1.0)  # Red
-                                    other_ellipse.setPen(other_pen)
-                            self.scene.update()
-                            self.dragging = False  # Prevent drag
-                            event.accept()
-                            return
-                # Check for circle click
-                for circle, ra, dec, classifier, normal_thickness in self.circles:
-                    circle_rect = circle.rect()
-                    circle_center = circle_rect.center()
-                    distance = ((scene_pos.x() - circle_center.x())**2 + (scene_pos.y() - circle_center.y())**2)**0.5
-                    if distance <= 10:
-                        if self.control_dock:
-                            self.control_dock.select_coord_list_item(ra, dec)
-                            if self.control_dock.selected_circle and self.control_dock.selected_circle != circle:
-                                normal_pen = self.control_dock.selected_circle.pen()
-                                normal_pen.setWidthF(normal_thickness)
-                                self.control_dock.selected_circle.setPen(normal_pen)
-                            pen = QPen(circle.pen().color(), normal_thickness * 1.5)
-                            circle.setPen(pen)
-                            self.control_dock.selected_circle = circle
-                            self.scene.update()
-                        self.dragging = False  # Prevent drag
-                        event.accept()
-                        return
+                # If we hit an object, we 'return' so we don't refresh the preview unnecessarily
+                if self.handle_object_click(scene_pos):
+                    event.accept()
+                    return
 
-            # Handle drag (only if not a click on an ellipse/circle)
-            if not was_click:
-                self.refresh_preview()
+            # If it wasn't a click on an object, update the preview 
+            self.refresh_preview()
 
+        # 3. Middle Button Logic
         elif event.button() == Qt.MidButton:
-            self.is_measuring = False
-            self.measure_start = None
-            self.measure_end = None
-            self.start_ra_dec = None
-            self.end_ra_dec = None
-            self.angular_offset = None
-            self.offset_unit = None
-            self.horizontal_offset = None
-            self.horizontal_unit = None
-            self.vertical_offset = None
-            self.vertical_unit = None
+            self.clear_measuring_state()
             self.setDragMode(QGraphicsView.ScrollHandDrag)
             self.viewport().update()
 
-        self.dragging = False
+        # Final cleanup
         super().mouseReleaseEvent(event)
 
 
+    def clear_measuring_state(self):
+        self.is_measuring = False
+        self.start_point = None
+        self.start_ra_dec = None
+        self.angular_offset = None
+        self.offset_unit = None
+        self.horizontal_offset = None
+        self.horizontal_unit = None
+        self.vertical_offset = None
+        self.vertical_unit = None
+        
+
+    def handle_screenshot_release(self, _event):
+        """
+        Helper to finalize the rectangle selection process and trigger the save callback.
+        'event' is unused for now
+        """
+        if self.callback_on_selection:
+            # 1. Finalize the rectangle geometry
+            self.selection_rect = QRectF(self.start_point, self.end_point).normalized()
+            
+            # 2. Clean up visual scene items
+            if self.rubber_band:
+                self.scene.removeItem(self.rubber_band)
+                self.rubber_band = None
+            
+            # 3. Restore UI state
+            self.setCursor(Qt.ArrowCursor)
+            
+            # 4. Execute the stored callback (e.g., self.handle_selection_rect)
+            self.callback_on_selection(self.selection_rect)
+            
+            # 5. Reset internal selection variables
+            self.callback_on_selection = None
+            self.start_point = None
+            self.end_point = None
+            self.rectangle_selection = False
+
+            
+    def handle_object_click(self, scene_pos):
+        """
+        Checks if a click at scene_pos hits a MER ellipse or a user-created circle.
+        Returns True if an object was handled, False otherwise. Used in mouseReleaseEvent()
+        """
+        # 1. Check for MER catalog ellipse click
+        if self.catalog_manager and self.catalog_manager.MER_items:
+            for ellipse in self.catalog_manager.MER_items:
+                rect = ellipse.rect()
+                center = rect.center()
+                # Use Euclidean distance check (radius of 10 pixels)
+                distance = ((scene_pos.x() - center.x())**2 + (scene_pos.y() - center.y())**2)**0.5
+            
+                if distance <= 10:
+                    object_id = ellipse.data(0)
+                    if object_id is not None and self.control_dock:
+                        self.control_dock.select_table_row(object_id)
+                        # Highlight selected (Yellow), reset others (Red)
+                        pen = QPen(QColor(255, 255, 0), 1.5) 
+                        ellipse.setPen(pen)
+                        for other in self.catalog_manager.MER_items:
+                            if other != ellipse:
+                                other.setPen(QPen(QColor(255, 0, 0), 1.0))
+                        self.scene.update()
+                        # We return early, and thus QGraphicsView does not receive the releaseEvent signal and thus drags
+                        # the image after the click. Hence we need the next two lines
+                        self.setDragMode(QGraphicsView.NoDrag)
+                        self.setDragMode(QGraphicsView.ScrollHandDrag)
+                        return True # Click handled
+
+        # 2. Check for manual annotation circle click
+        for circle, ra, dec, classifier, normal_thickness in self.circles:
+            circle_rect = circle.rect()
+            circle_center = circle_rect.center()
+            distance = ((scene_pos.x() - circle_center.x())**2 + (scene_pos.y() - circle_center.y())**2)**0.5
+        
+            if distance <= 10:
+                if self.control_dock:
+                    self.control_dock.select_coord_list_item(ra, dec)
+                    # Handle visual thickening of the selected circle
+                    if self.control_dock.selected_circle and self.control_dock.selected_circle != circle:
+                        old_pen = self.control_dock.selected_circle.pen()
+                        old_pen.setWidthF(normal_thickness)
+                        self.control_dock.selected_circle.setPen(old_pen)
+                
+                    new_pen = QPen(circle.pen().color(), normal_thickness * 1.5)
+                    circle.setPen(new_pen)
+                    self.control_dock.selected_circle = circle
+                    self.scene.update()
+                    self.setDragMode(QGraphicsView.NoDrag)
+                    self.setDragMode(QGraphicsView.ScrollHandDrag)
+                return True # Click handled
+
+        return False # No object found at this position
+
+    
     def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.dragging = False
         super().mouseDoubleClickEvent(event)
         
     def wheelEvent(self, event):
@@ -849,44 +965,48 @@ class ImageViewer(QGraphicsView):
                         break
         super().keyPressEvent(event)
 
+    # This function is a virtual hook
+    # It is executed automatically by the Qt Event Loop as part of the view's internal
+    # rendering pipeline and is thus not called explicitly anywhere.
+    # The rendering is triggered by calling self.viewport().update()
     def drawForeground(self, painter, rect):
         # this draws a ruler when dragging with the middle mouse button
         super().drawForeground(painter, rect)
-        if self.is_measuring and self.measure_start and self.measure_end:
+        if self.is_measuring and self.start_point and self.current_point:
             painter.setRenderHint(QPainter.Antialiasing)
             solid_pen = QPen(QColor(255, 255, 0), 1, Qt.SolidLine)
             solid_pen.setCosmetic(True)
             painter.setPen(solid_pen)
-            painter.drawLine(self.measure_start, self.measure_end)
+            painter.drawLine(self.start_point, self.current_point)
             dashed_pen = QPen(QColor(255, 255, 0), 1, Qt.DashLine)
             dashed_pen.setCosmetic(True)
             painter.setPen(dashed_pen)
-            painter.drawLine(self.measure_start, QPointF(self.measure_end.x(), self.measure_start.y()))
-            painter.drawLine(QPointF(self.measure_end.x(), self.measure_start.y()), self.measure_end)
+            painter.drawLine(self.start_point, QPointF(self.current_point.x(), self.start_point.y()))
+            painter.drawLine(QPointF(self.current_point.x(), self.start_point.y()), self.current_point)
             painter.setWorldMatrixEnabled(False)
             font = QFont("Arial", 10)
             pen = QPen(QColor(255, 255, 0), 1)
             painter.setFont(font)
             painter.setPen(pen)
             if self.angular_offset is not None and self.offset_unit:
-                mid_x = (self.measure_start.x() + self.measure_end.x()) / 2
-                mid_y = (self.measure_start.y() + self.measure_end.y()) / 2
+                mid_x = (self.start_point.x() + self.current_point.x()) / 2
+                mid_y = (self.start_point.y() + self.current_point.y()) / 2
                 mid_scene = QPointF(mid_x, mid_y)
                 mid_viewport = self.mapFromScene(mid_scene)
                 label_pos = QPointF(mid_viewport.x(), mid_viewport.y() - 10)
                 text = f"{self.angular_offset:.2f} {self.offset_unit}"
                 painter.drawText(label_pos, text)
             if self.horizontal_offset is not None and self.horizontal_unit:
-                hor_x = (self.measure_start.x() + self.measure_end.x()) / 2
-                hor_y = self.measure_start.y()
+                hor_x = (self.start_point.x() + self.current_point.x()) / 2
+                hor_y = self.start_point.y()
                 hor_scene = QPointF(hor_x, hor_y)
                 hor_viewport = self.mapFromScene(hor_scene)
                 label_pos = QPointF(hor_viewport.x(), hor_viewport.y() + 20)
                 text = f"{self.horizontal_offset:.2f} {self.horizontal_unit}"
                 painter.drawText(label_pos, text)
             if self.vertical_offset is not None and self.vertical_unit:
-                ver_x = self.measure_end.x()
-                ver_y = (self.measure_start.y() + self.measure_end.y()) / 2
+                ver_x = self.current_point.x()
+                ver_y = (self.start_point.y() + self.current_point.y()) / 2
                 ver_scene = QPointF(ver_x, ver_y)
                 ver_viewport = self.mapFromScene(ver_scene)
                 label_pos = QPointF(ver_viewport.x() + 10, ver_viewport.y())
@@ -980,104 +1100,168 @@ class ImageViewer(QGraphicsView):
                 return False
         
     def save_full_image_with_overlays(self):
-        # To store a very large image with overlays, we must zoom out so that the full image is visible.
-        # Otherwise, the code crashes, or the catalog items are not displayed
-        current_rect = self.mapToScene(self.viewport().rect()).boundingRect()
-        self.fit_to_view()   # we are not updating the view, so this runs in the background 
-        self.save_visible_area_with_overlays()
-        # restore the view
-        self.fitInView(current_rect)
-        
+        """Saves the entire image with all current overlays at full resolution."""
+        if self.original_image is None:
+            return
+
+        # 1. Disable buttons to prevent race conditions (if the user erroneously double-clicked)
+        if self.control_dock:
+            self.control_dock.photoPushButton.setEnabled(False)
+
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            
+            # Store current view to restore later
+            current_rect = self.sceneRect()
+            
+            # 2. Setup rendering logic: Expand scene to full image size
+            self.fit_to_view()
+            
+            # Define output path (Euclid naming convention)
+            filename = f"{self.dirpath}/{self.tileID}_{cen_ra:.6f}_{cen_dec:.5f}.png"
+            
+            # 3. Execution Logic: Create the high-resolution buffer
+            # We use QImage.Format_ARGB32_Premultiplied for best performance with overlays
+            size = self.scene.itemsBoundingRect().size().toSize()
+            image_buffer = QImage(size, QImage.Format_ARGB32_Premultiplied)
+            image_buffer.fill(Qt.black)
+
+            # Paint the scene (Image + MER Overlays) into the buffer
+            painter = QPainter(image_buffer)
+            painter.setRenderHint(QPainter.Antialiasing)
+            self.scene.render(painter)
+            painter.end()
+
+            # 4. Save Logic: Use the existing image_saver helper
+            # This ensures consistent metadata handling
+            self.image_saver(image_buffer, filename)
+            
+            # Restore the user's zoom level
+            # self.setSceneRect(current_rect)
+            # self.fit_to_view()
+            self.fitInView(current_rect)
+             
+            if self.main_window:
+                self.main_window.statusBar().showMessage(f"Saved full resolution image to {filename}", 5000)
+
+        except Exception as e:
+            print(f"Error during full resolution save: {e}")
+            if self.main_window:
+                self.main_window.statusBar().showMessage("Error saving full resolution image", 5000)
+
+        finally:
+            # 5. Re-enable buttons and restore cursor
+            if self.control_dock:
+                self.control_dock.SmallPushButton.setEnabled(True)
+            QApplication.restoreOverrideCursor()
+
 
     def save_visible_area_with_overlays(self):
-        """
-        Saves the currently visible area of the graphics view, including all
-        overlays, as a PNG file at the native resolution (zoom level 1.0).
-        """
+        """Saves only the currently visible area of the image and overlays."""
+        if self.original_image is None:
+            return
         if not self.qimage:
-            print("No image loaded.")
             return
 
-        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
-        # Get the visible rectangle in scene coordinates
-        visible_rect_scene = self.mapToScene(self.viewport().rect()).boundingRect()
+        # 1. Disable buttons to prevent race conditions during the capture
+        if self.control_dock:
+            self.control_dock.SmallPushButton.setEnabled(False)
 
-        # Ensure the visible rect is within the bounds of the original image
-        image_rect = QRectF(0, 0, self.qimage.width(), self.qimage.height())
-        clipped_rect_scene = visible_rect_scene.intersected(image_rect)
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
 
-        if clipped_rect_scene.isEmpty():
-            print("Visible area is empty or outside image bounds.")
-            return
+            # 2. Determine the visible region in scene coordinates
+            # viewport().rect() is the size of the window widget
+            # mapToScene() converts that window box into the image's coordinate system
+            visible_scene_rect = self.mapToScene(self.viewport().rect()).boundingRect()
+            
+            # Ensure the rectangle is within the image bounds to avoid black borders
+            visible_scene_rect = visible_scene_rect.intersected(self.sceneRect())
 
-        # Convert the visible scene rectangle to image coordinates (at zoom level 1.0)
-        target_size = clipped_rect_scene.size().toSize()
-        target = QImage(target_size, QImage.Format_ARGB32_Premultiplied)
-        target.fill(Qt.transparent)
+            # 3. Create a buffer matching the size of the visible pixels
+            # We use the integer size of the viewport for a 1:1 screen-to-file match
+            output_size = self.viewport().size()
+            image_buffer = QImage(output_size, QImage.Format_ARGB32_Premultiplied)
+            image_buffer.fill(Qt.black)
 
-        painter = QPainter(target)
-        painter.setRenderHint(QPainter.Antialiasing) # Optional: Enable anti-aliasing
+            # 4. Render only the visible portion
+            painter = QPainter(image_buffer)
+            painter.setRenderHint(QPainter.Antialiasing)
+            
+            # This specific render call maps the scene's visible rect 
+            # exactly onto the image_buffer's rect
+            self.scene.render(painter, QRectF(image_buffer.rect()), visible_scene_rect)
+            painter.end()
 
-        # Render the scene onto the target image, translating so the visible area aligns
-        self.scene.render(painter, QRectF(target.rect()), clipped_rect_scene)
-        rect_x = clipped_rect_scene.center().x()
-        rect_y = clipped_rect_scene.center().y()
-        rect_y = self.original_image.shape[0] - rect_y
-        cen_ra, cen_dec = self.wcs.pixel_to_world(rect_x, rect_y)
+            # 5. Define filename and save
+            rect_x = visible_scene_rect.center().x()
+            rect_y = visible_scene_rect.center().y()
+            rect_y = self.original_image.shape[0] - rect_y
+            cen_ra, cen_dec = self.wcs.pixel_to_world(rect_x, rect_y)
 
-        painter.end()
+            filename = f"{self.dirpath}/{self.tileID}_{cen_ra:.6f}_{cen_dec:.5f}.png"       
+            self.image_saver(image_buffer, filename)
+            
+            if self.main_window:
+                self.main_window.statusBar().showMessage(f"Saved visible area to {filename}", 5000)
 
-        filename = f"{self.dirpath}/cutout_{cen_ra:.6f}_{cen_dec:.5f}.png"
-        self.image_saver(target, filename)
-        QApplication.restoreOverrideCursor()
+        except Exception as e:
+            print(f"Error during visible area save: {e}")
+            if self.main_window:
+                self.main_window.statusBar().showMessage("Error saving visible area", 5000)
+
+        finally:
+            # 6. Re-enable buttons and restore cursor
+            if self.control_dock:
+                self.control_dock.photoPushButton.setEnabled(True)
+            QApplication.restoreOverrideCursor()
 
     def save_area_from_selection(self, rect: QRectF):
         """
-        Saves the area within the given rectangle (in scene coordinates),
+        Saves the area defined by the selection rectangle
         including all overlays, as a PNG file at the native resolution (zoom level 1.0).
         """
+        if self.original_image is None:
+            return
         if not self.qimage:
             print("No image loaded.")
             return
 
-        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
-        self.rectangle_selection = True
+        # Create the high-quality buffer for the cutout
+        image_buffer = QImage(rect.size().toSize(), QImage.Format_ARGB32_Premultiplied)
+        image_buffer.fill(Qt.black)
 
-        # Ensure the selection rect is within the bounds of the original image
-        image_rect = QRectF(0, 0, self.qimage.width(), self.qimage.height())
-        clipped_rect_scene = rect.intersected(image_rect)
-
-        if clipped_rect_scene.isEmpty():
-            print("Selected area is empty or outside image bounds.")
-            self.rectangle_selection = False
-            return
-
-        # Convert the selected scene rectangle to image coordinates (at zoom level 1.0)
-        target_size = clipped_rect_scene.size().toSize()
-        target = QImage(target_size, QImage.Format_ARGB32_Premultiplied)
-        target.fill(Qt.transparent)
-
-        painter = QPainter(target)
-        painter.setRenderHint(QPainter.Antialiasing) # Optional: Enable anti-aliasing
-
-        # Render the scene onto the target image, translating so the selected area aligns
-        source_rect_scene = clipped_rect_scene
-        target_rect = QRectF(0, 0, target.width(), target.height())
-        self.scene.render(painter, target_rect, source_rect_scene)
-
+        painter = QPainter(image_buffer)
+        painter.setRenderHint(QPainter.Antialiasing)
+        # Render the specific part of the scene defined by 'rect'
+        self.scene.render(painter, QRectF(image_buffer.rect()), rect)
         painter.end()
-        filename = f"{self.dirpath}/{self.tileID}_cutout_{self.crosshair_ra:.6f}_{self.crosshair_dec:.5f}.png"
-        self.image_saver(target, filename)
 
-        self.rectangle_selection = False
-        QApplication.restoreOverrideCursor()
-        QApplication.setOverrideCursor(Qt.ArrowCursor)
+        filename = f"{self.dirpath}/{self.tileID}_{self.crosshair_ra:.6f}_{self.crosshair_dec:.5f}.png"       
+        self.image_saver(image_buffer, filename)
 
         
-    def handle_selection_rect(self, rect: QRectF):  # Internal callback
-        self.setCursor(Qt.CrossCursor)
-        """Handles the selected rectangle and saves the area."""
-        self.save_area_from_selection(rect)
+    def handle_selection_rect(self, rect: QRectF):
+        """Internal callback: Handles the selected rectangle and saves the area."""
+        # Prevent double-processing if buttons are already disabled
+        if self.control_dock and not self.control_dock.photoPushButton.isEnabled():
+            return
+
+        # 1. Disable buttons at the start
+        if self.control_dock:
+            self.control_dock.photoPushButton.setEnabled(False)
+
+        try:
+            self.setCursor(Qt.CrossCursor)
+            self.save_area_from_selection(rect)
+        finally:
+            # 2. Re-enable buttons and cleanup state no matter what happens
+            self.rectangle_selection = False
+            if self.control_dock:
+                self.control_dock.photoPushButton.setEnabled(True)
+            
+            QApplication.restoreOverrideCursor()
+            QApplication.setOverrideCursor(Qt.ArrowCursor)
 
     def set_image(self, qimage: QImage):
         self.qimage = qimage
@@ -1096,15 +1280,15 @@ class ImageViewer(QGraphicsView):
             self.scene.removeItem(self.rubber_band)
             self.rubber_band = None
         self.start_point = None
-        self.end_point = None
+        self.current_point = None
         self.selection_rect = None
         self.setCursor(Qt.ArrowCursor)
         
-    def start_selection(self):  # Removed callback argument
+    def start_selection(self):  # Called when the user clicks the photo button
         self.rectangle_selection = True
         QApplication.setOverrideCursor(Qt.CrossCursor)
         self.start_point = None
-        self.end_point = None
+        self.current_point = None
         self.selection_rect = None
-        self.callback_on_selection = self.handle_selection_rect  # Set the callback here
+        self.callback_on_selection = self.handle_selection_rect
 

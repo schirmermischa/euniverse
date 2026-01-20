@@ -433,38 +433,129 @@ class PlotDialog(QDialog):
         self.figure.clear()
         
         # Sky scatter plot:
-        # FIRST BRANCH DEACTIVATED BY SELECTING AN INVALID DECLINATION KEYWORD NAME; LASSO SELECT DOES NOT RETURN CORRECT DATA COORDINATES
+        # first section never evaluated because of deliberatly chosing non-existing dec keyword
+        # (lasso selection does not work in WCS mode)
         if x_label == "RIGHT_ASCENSION" and y_label == "DECLINATION2":
             # Convert RA, Dec to SkyCoord object
             coords = SkyCoord(ra=x_data*u.degree, dec=y_data*u.degree, frame='icrs')
-            mean_ra = coords.ra.mean().value
-            mean_dec = coords.dec.mean().value
-            center_coord = SkyCoord(ra=mean_ra*u.degree, dec=mean_dec*u.degree, frame='icrs')
-            # Set up WCS for tangential (gnomonic) projection
+
             wcs = WCS(naxis=2)
-            wcs.wcs.crval = [mean_ra, mean_dec]  # Reference coordinate (center of plot)
-            wcs.wcs.ctype = ['RA---TAN', 'DEC--TAN']  # Tangential projection
-            # Create figure and axis with WCS projection
+            wcs.wcs.crval = [coords.ra.mean().value, coords.dec.mean().value]
+            wcs.wcs.ctype = ['RA---TAN', 'DEC--TAN']
+            
+            # 2. Create WCS Axes for tangential (gnomonic) projection
             self.ax = self.figure.add_subplot(111, projection=wcs)
+
             # Prepare the sources
             ra_deg = coords.ra.deg
             dec_deg = coords.dec.deg
             x_data, y_data = wcs.wcs_world2pix(ra_deg, dec_deg, 0)
-        elif x_label == "RIGHT_ASCENSION" and y_label == "DECLINATION":
-            self.mirror_x_axis = True        
+            # Plot the data. When projection is set, scatter expects World coordinates
+            if z_label and z_label != "":
+                self.artist = self.ax.scatter(coords.ra.deg, coords.dec.deg, c=z_data, cmap=cmap_name,
+                                              transform=self.ax.get_transform('world'), s=symsize,
+                                              picker=True, pickradius=3, norm=norm_param)
+            else:
+                self.artist = self.ax.scatter(coords.ra.deg, coords.dec.deg, 
+                                              transform=self.ax.get_transform('world'), s=symsize,
+                                              picker=True, pickradius=3)
         else:
-            # Normal scatter plot
-            self.mirror_x_axis = False
-            self.ax = self.figure.add_subplot(111)  # Add a new subplot
+            self.ax = self.figure.add_subplot(111)
+            if x_label == "RIGHT_ASCENSION" and y_label == "DECLINATION2":
+                self.mirror_x_axis = True
+            else:
+                self.mirror_x_axis = False
+            if z_label and z_label != "":
+                self.artist = self.ax.scatter(x_data, y_data, c=z_data, cmap=cmap_name, s=symsize, picker=True,
+                                              pickradius=3, norm=norm_param)
+            else:
+                self.artist = self.ax.scatter(x_data, y_data, s=symsize, picker=True, pickradius=3)
 
-        # With or without color map
-        if z_label and z_label != "":
-            self.artist = self.ax.scatter(x_data, y_data, c=z_data, cmap=cmap_name, s=symsize, picker=True,
-                                          pickradius=3, norm=norm_param)
+        # Initialize Lasso with the axes' display transformation
+        # Lasso normally selects in data space, but when we plot RA/DEC with WCS transformation, then this fails.
+        # hence we must select in display space
+        self.lasso = LassoSelector(self.ax, onselect=self.on_select,
+                                   props={'color': 'black', 'linewidth': 1, 'alpha': 0.8})
+        self.artist.set_alpha(0.3)
+        self.canvas.draw()
+        
+    def highlight_selected_points(self, indices):
+        # Reset previous selection alpha
+        self.artist.set_alpha(0.3)
+        
+        # Here we create or update a 'selection' scatter overlay
+        # or simply print the count for now
+        self.image_viewer.update_status(f"Selected {len(indices)} points.", 6000)
+        
+        # Update the parent table if needed
+        if self.image_viewer and self.image_viewer.main_window:
+            # Example: Select the first index in the table
+            obj_id = self.catalog['OBJECT_ID'][indices[0]]
+            self.image_viewer.control_dock.select_table_row(obj_id)
+            
+        self.canvas.draw_idle()
+
+    # overriding class definition
+    def on_select(self, verts):
+        # Prevent error if scatter hasn't been created yet
+        if not hasattr(self, 'artist') or self.artist is None:
+            return
+
+        path = Path(verts)
+        # Because we use the 'world' transform in make_scatterplot,
+        # get_offsets() returns degrees, and verts are in degrees for RA/Dec plots
+        self.indices = np.nonzero(path.contains_points(self.artist.get_offsets()))[0]
+        
+        if self.indices.size > 0:
+            # Use the existing method in your PlotDialog class
+            self.highlight_selected_points(self.indices)
         else:
-            self.artist = self.ax.scatter(x_data, y_data, s=symsize, picker=True, pickradius=3)
-            
-            
+            # Reset view if nothing selected
+            self.artist.set_alpha(0.7)
+            self.canvas.draw_idle()
+
+    def on_select_old(self, verts):
+        # 1. Path is created from lasso vertices (Display/Pixel space)
+        path = Path(verts)
+        
+        # 2. Get the raw numeric offsets from the scatter plot
+        xy = self.scatter.get_offsets()
+        
+        # 3. Transform the data points into Display space (pixels)
+        # This handles both linear axes and WCS projections automatically
+        trans = self.scatter.get_transform()
+        pixel_coords = trans.transform(xy)
+        
+        # 4. Perform the selection check
+        self.indices = np.nonzero(path.contains_points(pixel_coords))[0]
+        
+        if self.indices.size > 0:
+            # Instead of a missing method, use the logic to highlight points
+            self.highlight_selected_points(self.indices)
+
+    def on_select_old(self, verts):
+        # 1. Get the path from the lasso (these are in Data coordinates)
+        path = Path(verts)
+        
+        # 2. Get the raw data points from the scatter plot
+        # These will be RA/Dec if using WCS, or X/Y if linear
+        xy = self.artist.get_offsets()
+        
+        # 3. TRANSFORM the data points into the same space as the Lasso path
+        # If it's a WCSAxes, we use its specific transformation logic
+        trans = self.artist.get_transform()
+        # This converts the catalog coordinates into the visual coordinates 
+        # that match the 'verts' from the mouse movement.
+        pixel_coords = trans.transform(xy)
+        
+        # 4. Perform the selection check in that transformed space
+        self.indices = np.nonzero(path.contains_points(pixel_coords))[0]
+        
+        if self.indices.size > 0:
+            print(f"Selected {len(self.indices)} sources.")
+            # Trigger your highlighting/table selection logic here
+            self.update_plots_selection()
+
     def on_analyse_plot_toggled(self, checked):
         """
         Toggles interactive mode for selecting data points on the plot.
@@ -637,6 +728,50 @@ class PlotDialog(QDialog):
 
     def deactivate_lasso_selector(self):
         """Deactivates the lasso selector tool and restores toolbar navigation."""
+        try:
+            if self.lasso_selector is not None:
+                self.lasso_selector.set_active(False)
+                if self._lasso_connection_id is not None:
+                    self.canvas.mpl_disconnect(self._lasso_connection_id)
+                    self._lasso_connection_id = None
+                self.lasso_selector = None
+
+            # Restore point colors with safety checks
+            if self.artist is not None and self.original_colors is not None:
+                # Ensure original_colors is a valid shape for the artist
+                if self.zaxisComboBox.currentText():
+                    self.artist.set_array(np.atleast_1d(self.original_colors).flatten())
+                else:
+                    self.artist.set_facecolors(self.original_colors)
+                
+                if self.canvas:
+                    self.canvas.draw_idle()
+
+            self.selected_indices = np.array([], dtype=int)
+            self.original_colors = None
+
+            # Restore toolbar navigation
+            self.toolbar.set_message = self.original_toolbar_set_message
+            self.toolbar.mode = '' 
+            for action_name in ['pan', 'zoom']:
+                if action_name in self.toolbar._actions:
+                    action = self.toolbar._actions[action_name]
+                    if action.isChecked():
+                        action.setChecked(False)
+                        action.toggled.emit(False)
+
+            self.setCursor(Qt.ArrowCursor)
+            if self.canvas:
+                self.canvas.setFocus()
+                self.canvas.draw_idle()
+            
+            if self.image_viewer:
+                self.image_viewer.update_status("Lasso selection disabled.", 2000)
+        except Exception as e:
+            print(f"Error during lasso deactivation: {e}")
+
+    def deactivate_lasso_selector_old(self):
+        """Deactivates the lasso selector tool and restores toolbar navigation."""
         if self.lasso_selector is not None:
             self.lasso_selector.set_active(False)
             if self._lasso_connection_id is not None:
@@ -684,6 +819,63 @@ class PlotDialog(QDialog):
             self.image_viewer.update_status("Lasso selection disabled.", 2000)
 
     def on_lasso_select(self, verts):
+        """Handles the lasso selection event with defensive array shaping."""
+        if self.plotted_x_data is None or self.plotted_y_data is None or self.artist is None:
+            return
+
+        try:
+            # Create path from lasso vertices
+            path = Path(verts)
+            points = np.column_stack([self.plotted_x_data, self.plotted_y_data])
+            
+            # Find indices of points inside the lasso path
+            ind = np.nonzero(path.contains_points(points))[0]
+
+            # Update selected OBJECT_IDs
+            if self.plotted_object_ids is not None and ind.size > 0:
+                new_selected_ids = self.plotted_object_ids[ind]
+                self.selected_object_ids = np.union1d(self.selected_object_ids, new_selected_ids)
+                # Ensure 1D and flattened
+                self.selected_indices = np.where(np.isin(self.plotted_object_ids, self.selected_object_ids))[0]
+                self.selected_indices = self.selected_indices.flatten()
+                self.lasso_points_selected.emit(self.selected_object_ids.tolist())
+            else:
+                self.selected_indices = np.union1d(self.selected_indices, ind).flatten()
+                self.lasso_points_selected.emit([])
+
+            # Update colors
+            if self.zaxisComboBox.currentText():
+                colors = self.original_colors.copy()
+                # Ensure the color mapping is rank-1
+                colors = np.atleast_1d(colors).flatten()
+                colors[self.selected_indices] = np.max(colors)
+                self.artist.set_array(colors)
+            else:
+                n_points = len(self.plotted_x_data)
+                default_color = self.artist.get_facecolors()[0] if len(self.artist.get_facecolors()) > 0 else to_rgba('tab:blue')
+                colors = np.tile(default_color, (n_points, 1))
+                colors[self.selected_indices] = to_rgba('tab:red')
+                # Ensure non-selected points keep their original color
+                mask = np.ones(n_points, dtype=bool)
+                mask[self.selected_indices] = False
+                colors[mask] = to_rgba('tab:blue')
+                self.artist.set_facecolors(colors)
+
+            self.original_colors = colors.copy()
+            self.canvas.draw_idle() # Safer than draw() during rapid selection
+
+            if self.image_viewer and self.selected_indices.size > 0 and self.plotted_object_ids is not None:
+                selected_ids = self.plotted_object_ids[self.selected_indices]
+                self.image_viewer.display_selected_MER(selected_ids.tolist())
+                self.image_viewer.update_status(f"Selected {len(selected_ids)} objects.", 2000)
+                
+        except ValueError as ve:
+            print(f"Caught Matplotlib rank error: {ve}")
+        except Exception as e:
+            print(f"Error in on_lasso_select: {e}")
+
+
+    def on_lasso_select_old(self, verts):
         """Handles the lasso selection event."""
         # DOES NOT WORK WITH WCS PLOT, BECAUSE DISPLAY COORDINATES ARE NOT PROPERLY TRANSFORMED TO DATA COORDINATES. UNCLEAR WHY
         
@@ -730,7 +922,11 @@ class PlotDialog(QDialog):
 
         if self.image_viewer and self.selected_indices.size > 0 and self.plotted_object_ids is not None:
             selected_ids = self.plotted_object_ids[self.selected_indices]
+            
+            # Call the new display method in the viewer
+            self.image_viewer.display_selected_MER(selected_ids.tolist())
             self.image_viewer.update_status(f"Selected {len(selected_ids)} objects.", 2000)
+
 
 
     def add_navigation_toolbar(self):
