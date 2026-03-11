@@ -1,5 +1,32 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# euniverse.py - A program to display MER colour images created with eummy
+
+# MIT License
+
+# Copyright (c) [2026] [Mischa Schirmer]
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 import os
-from PyQt5.QtWidgets import QDialog, QAbstractItemView, QTableView, QVBoxLayout, QHeaderView, QGraphicsEllipseItem, QGraphicsView 
+from PyQt5.QtWidgets import QDialog, QAbstractItemView, QTableView, QVBoxLayout, QHeaderView, QGraphicsEllipseItem
 from PyQt5.QtCore import Qt, QAbstractTableModel, QModelIndex, QPointF
 from PyQt5.QtGui import QColor, QPen
 from astropy.table import Table, MaskedColumn
@@ -202,88 +229,45 @@ class TableDialog(QDialog):
 
     def on_row_selected(self, index):
         """
-        Handles row selection: highlights the object in the viewer and centers it.
+        Handles row selection: highlights the matching ellipse yellow, resets
+        all others to red, and centres the viewer on the selected object.
+
+        Does NOT touch the viewer's drag mode — changing it here leaves the
+        viewer stuck in NoDrag after the table click, breaking panning.
         """
         if not index.isValid() or self.catalog is None or self.viewer is None:
             return
 
         self.selected_row = index.row()
-        # Retrieve the OBJECT_ID from the actual catalog data using the row index
         object_id = self.catalog['OBJECT_ID'][index.row()]
 
-        # Iterate through scene items to find the matching QGraphicsEllipseItem
         for item in self.viewer.scene.items():
-            if isinstance(item, QGraphicsEllipseItem) and item.data(0) == object_id:
-                # Highlight the selected ellipse in yellow
-                pen = QPen(QColor(255, 255, 0), 1.5)
-                item.setPen(pen)
-
-                # Center the ImageViewer on this object
-                rect = item.rect()
-                center_scene = item.mapToScene(rect.center())
+            if not isinstance(item, QGraphicsEllipseItem):
+                continue
+            if item.data(0) == object_id:
+                item.setPen(QPen(QColor(255, 255, 0), 1.5))
+                center_scene = item.mapToScene(item.rect().center())
                 self.viewer.centerOn(center_scene)
-                
-                # Reset cursor state for the viewport
-                self.viewer.setDragMode(QGraphicsView.NoDrag)
-                self.viewer.viewport().setCursor(Qt.ArrowCursor)
-            
-            elif isinstance(item, QGraphicsEllipseItem):
-                # Reset other ellipses to red
-                pen = QPen(QColor(255, 0, 0), 1.0)
-                item.setPen(pen)
+            elif item.data(0) is not None:
+                # Only reset items that belong to the MER catalog overlay
+                # (data(0) is set to OBJECT_ID by catalog_manager._make_ellipse)
+                item.setPen(QPen(QColor(255, 0, 0), 1.0))
 
         self.viewer.scene.update()
 
-    def init_ui(self):
-        layout = QVBoxLayout()
-
-        # Create table view
-        self.table_view = QTableView()
-        self.table_model = CatalogTableModel(self.catalog, self.required_columns)  # Pass required_columns
-        self.table_view.setModel(self.table_model)
-
-        # Configure table appearance
-        self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table_view.setEditTriggers(QAbstractItemView.NoEditTriggers)  # Make it read-only
-        self.table_view.setAlternatingRowColors(True)
-        self.table_view.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-
-        layout.addWidget(self.table_view)
-        self.setLayout(layout)
-        self.resize(800, 600)
-
-        # Connect row selection
-        self.table_view.clicked.connect(self.on_row_clicked)
-
-    def on_row_clicked(self, index):
-        """
-        Handles row clicks in the table: highlights ellipse and centers the *view* on it.
-        Does not change the drag mode.
-        """
-        if not self.viewer or not self.catalog or not self.viewer.wcs or self.viewer.original_image is None:
-            print("Invalid state: viewer, catalog, wcs, or original_image missing")
+    def _reset_highlights(self):
+        """Reset all MER ellipses to their default red colour."""
+        if self.viewer is None:
             return
-
-        self.selected_row = index.row()
-        object_id = self.catalog['OBJECT_ID'][index.row()]
-
-        # Highlight corresponding ellipse
         for item in self.viewer.scene.items():
-            if isinstance(item, QGraphicsEllipseItem) and item.data(0) == object_id:
-                pen = QPen(QColor(255, 255, 0), 1.5)  # Yellow
-                item.setPen(pen)
-
-                # Center the *view* on the ellipse's center
-                rect = item.rect()
-                center_scene = item.mapToScene(rect.center())
-                self.viewer.centerOn(center_scene)
-                self.viewer.setDragMode(QGraphicsView.NoDrag)
-                self.viewer.viewport().setCursor(Qt.ArrowCursor)  # Change the cursor too
-            elif isinstance(item, QGraphicsEllipseItem) and item.data(0) != object_id:
-                pen = QPen(QColor(255, 0, 0), 1.0)  # Red
-                item.setPen(pen)
-
+            if isinstance(item, QGraphicsEllipseItem) and item.data(0) is not None:
+                item.setPen(QPen(QColor(255, 0, 0), 1.0))
         self.viewer.scene.update()
+
+    def closeEvent(self, event):
+        """Reset any yellow highlight when the table is closed."""
+        self._reset_highlights()
+        super().closeEvent(event)
 
     def select_row_by_object_id(self, object_id):
         if not self.catalog:

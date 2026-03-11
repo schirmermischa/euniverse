@@ -1,20 +1,71 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# euniverse.py - A program to display MER colour images created with eummy
+
+# MIT License
+
+# Copyright (c) [2026] [Mischa Schirmer]
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""
+control_dock.py — Left-side control panel widget
+=================================================
+ControlDock is a QWidget loaded from control_dock.ui that provides all the
+controls for the main viewer: image loading, contrast sliders, zoom buttons,
+the navigator thumbnail, the magnifier, coordinate display, the MER overlay
+toggle, the scatter-plot dialog trigger, annotation management, and the
+photo / screenshot button.
+
+Design notes
+------------
+- ControlDock holds a reference to ImageViewer (self.viewer) so it can call
+  its public API.  It must NOT access private attributes (names starting with
+  _) of ImageViewer directly; instead, it uses the named public methods such
+  as viewer.discard_preview_crop().
+- Annotation circles are stored in viewer.annotations as Annotation dataclass
+  instances (annotations.py).  This file uses named field access (ann.ra,
+  ann.dec, ann.classifier) instead of positional tuple unpacking.
+- Network upload (on_submit_targets) runs in a CsvUploader background thread
+  defined in workers.py, keeping the UI responsive during the POST request.
+"""
+
 from PyQt5.QtWidgets import (
-    QApplication, QLabel, QListWidget, QSlider, QWidget, QPushButton, QHBoxLayout, QFrame
+    QApplication, QLabel, QListWidget, QSlider, QWidget, QPushButton,
+    QHBoxLayout, QFrame, QVBoxLayout,
 )
-from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QCursor
-from PyQt5.QtCore import Qt, QPointF, QRectF, QSize
+from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QCursor, QIcon
+from PyQt5.QtCore import Qt, QPointF, QRectF, QSize, QThread
 from PyQt5 import uic
 import os
 import getpass
 from datetime import datetime
-import requests
 import csv
 from astropy.coordinates import SkyCoord
 import astropy.units as u
+import numpy as np
 
 from .generate_icons import *
 from .table_dialog import TableDialog
 from .catalog_plotter import PlotDialog
+from .workers import CsvUploader
 
 # Define NA as a recognized unit so the parser doesn't complain
 try:
@@ -143,7 +194,7 @@ class ControlDock(QWidget):
                 self.viewer.keyPressEvent(event)
             else:
                 QListWidget.keyPressEvent(self.coord_list, event)
-            self.coord_list.keyPressEvent = coord_list_key_press
+        self.coord_list.keyPressEvent = coord_list_key_press  # Install the handler
 
 #        self.setLayout(main_layout)
 
@@ -174,6 +225,7 @@ class ControlDock(QWidget):
         self.load_callback = None
         self.contrast_callback = None
         self.full_contrast_callback = None
+        self.slider_press_callback = None
         self.coord_list.itemClicked.connect(self.on_coord_list_item_clicked)
         self.selected_circle = None
         self.set_black_squares()
@@ -190,6 +242,9 @@ class ControlDock(QWidget):
 
     def set_load_callback(self, callback):
         self.load_callback = callback
+
+    def set_slider_press_callback(self, callback):
+        self.slider_press_callback = callback
 
     def set_contrast_callback(self, callback):
         self.contrast_callback = callback
@@ -218,76 +273,77 @@ class ControlDock(QWidget):
             self.viewer.fit_to_view()
 
     def on_save_targets(self):
-        if not self.viewer or not self.viewer.circles:
-            # No targets to save
+        if not self.viewer or not self.viewer.annotations:
             return
         image_path = self.viewer.tileID
-        base_name = os.path.splitext(os.path.basename(image_path))[0]
-        username = getpass.getuser()
-        timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        base_name  = os.path.splitext(os.path.basename(image_path))[0]
+        username   = getpass.getuser()
+        timestamp  = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         csv_filename = f"{self.viewer.dirpath}/{base_name}_{username}_{timestamp}.csv"
 
         with open(csv_filename, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(['RA', 'Dec', 'Classifier'])
-            for _, ra, dec, classifier, _ in self.viewer.circles:
-                writer.writerow([ra, dec, classifier])
+            # ann is an Annotation dataclass (annotations.py) — use named fields
+            for ann in self.viewer.annotations:
+                writer.writerow([ann.ra, ann.dec, ann.classifier])
         self.update_status(f"Saved targets to {csv_filename}")
 
     def on_submit_targets(self):
-        if not self.viewer or not self.viewer.circles:
+        if not self.viewer or not self.viewer.annotations:
             return
 
-        image_path = "image"
-        base_name = os.path.splitext(os.path.basename(image_path))[0]
-        username = getpass.getuser()
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_filename = f"{self.viewer.dirpath}/{base_name}_{username}_{timestamp}.csv"
-        
+        username     = getpass.getuser()
+        timestamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_filename = f"{self.viewer.dirpath}/image_{username}_{timestamp}.csv"
+
         with open(csv_filename, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(['RA', 'Dec', 'Classifier'])
-            for _, ra, dec, classifier, _ in self.viewer.circles:
-                writer.writerow([ra, dec, classifier])
-        try:
-            with open(csv_filename, 'rb') as f:
-                files = {'file': (csv_filename, f, 'text/csv')}
-                # Added timeout=10 to prevent infinite hang
-                response = requests.post(
-                    "https://www.euclid-ec.org/target_receiver",  # this URL does not yet exist
-                    files=files, 
-                    timeout=10 
-                )
-            
-            if response.status_code == 200:
-                self.update_status("Successfully uploaded targets.")
-            else:
-                self.update_status(f"Upload failed (Status: {response.status_code})")
-        except requests.exceptions.RequestException as e:
-            self.update_status("Network error: Could not reach server.")
-            print(f"Submission error: {e}")
+            # ann is an Annotation dataclass (annotations.py) — use named fields
+            for ann in self.viewer.annotations:
+                writer.writerow([ann.ra, ann.dec, ann.classifier])
+
+        # Upload in a background thread so the UI stays responsive.
+        # CsvUploader is defined in workers.py.
+        self._upload_thread  = QThread()
+        self._uploader       = CsvUploader(csv_filename)
+        self._uploader.moveToThread(self._upload_thread)
+        self._upload_thread.started.connect(self._uploader.run)
+        self._uploader.done.connect(self.update_status)
+        self._uploader.done.connect(self._upload_thread.quit)
+        self._upload_thread.start()
 
     def slider_pressed(self):
-        # Hide the MER catalog if it is shown
+        # Save the current view centre so we can restore it after the full pass
+        self.viewcenter = self.viewer.get_current_view_center()
+        # Hide the MER catalog overlay (too many items slows redraws during drag)
         if self.MER_PushButton.isChecked():
             self.viewer.toggle_MER()
-        self.viewcenter = self.viewer.get_current_view_center()
-            
+        # Capture the visible uint16 crop once, before any slider movement
+        if self.slider_press_callback:
+            self.slider_press_callback()
+
     def slider_changed(self):
+        # Fast numexpr preview on the pre-captured crop
         if self.contrast_callback:
             self.contrast_callback(self.min_slider.value(), self.max_slider.value())
 
     def slider_released(self):
-        self.viewer.is_preview_updated = False
+        # Full LUT pass on the entire original_image
         if self.full_contrast_callback:
             QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
             QApplication.processEvents()
             self.full_contrast_callback(self.min_slider.value(), self.max_slider.value())
             QApplication.restoreOverrideCursor()
-            # Show the catalog again if it was shown before
-            if self.MER_PushButton.isChecked():
-                self.viewer.toggle_MER()
-            self.viewer.restore_view_center(self.viewcenter)
+        # Discard the preview crop now that the full-image LUT pass is done.
+        # Using the named method keeps us from poking private attributes directly.
+        self.viewer.discard_preview_crop()
+        # Restore MER overlay if it was visible before
+        if self.MER_PushButton.isChecked():
+            self.viewer.toggle_MER()
+        # Restore scroll position
+        self.viewer.restore_view_center(self.viewcenter)
                 
     def degrees_to_sexagesimal(self, ra, dec):
         ra_hours = ra / 15.0
@@ -304,6 +360,11 @@ class ControlDock(QWidget):
         return ra_str, dec_str
 
     def update_cursor_display(self, x, y, ra, dec):
+        # If coordinates are None (mouse outside image)
+        if x is None or y is None:
+            # If 'none' propagates, then the coordinate conversion below crashes
+            return
+
         self.cartesianxLabel.setText(f"x = {x:.1f}")
         self.cartesianyLabel.setText(f"y = {y:.1f}")
         self.equatorialRALabel.setText(f"α = {ra:.6f}")
@@ -313,10 +374,14 @@ class ControlDock(QWidget):
         self.equatorialDecHexLabel.setText(f"δ = {dec_str}")
 
     def update_coord_list(self, entries):
+        """
+        Repopulate the coordinate list widget from a list of Annotation objects.
+        *entries* is viewer.annotations — a list of Annotation dataclass instances
+        (see annotations.py).  Named field access replaces the old tuple unpacking.
+        """
         self.coord_list.clear()
-        for _, ra, dec, classifier, _ in entries:
-            item_text = f"{ra:.6f}, {dec:.6f}, {classifier}"
-            self.coord_list.addItem(item_text)
+        for ann in entries:
+            self.coord_list.addItem(f"{ann.ra:.6f}, {ann.dec:.6f}, {ann.classifier}")
         self.coord_list.repaint()
         self.submit_targets_button.setEnabled(bool(entries))
         self.save_targets_button.setEnabled(bool(entries))
@@ -348,40 +413,34 @@ class ControlDock(QWidget):
 
     def _highlight_selected_circle(self, ra, dec):
         """
-        Helper to visually highlight a specific circle on the image viewer.
-        Ensures previously selected circles are returned to their normal state.
+        Visually highlight the annotation circle at (ra, dec) and reset the
+        previously selected one.
+
+        viewer.annotations is a list of Annotation dataclass instances
+        (annotations.py).  Named field access replaces the old tuple unpacking.
         """
-        if not self.viewer or not self.viewer.circles:
+        if not self.viewer or not self.viewer.annotations:
             return
 
-        # 1. Reset the previously selected circle if it exists
+        # Reset the previously selected circle if it still exists
         if self.selected_circle:
             try:
-                # We store the 'normal_thickness' in the circle tuple: 
-                # (item, ra, dec, classifier, normal_thickness)
-                for item, c_ra, c_dec, _, normal_thick in self.viewer.circles:
-                    if item == self.selected_circle:
-                        old_pen = item.pen()
-                        old_pen.setWidthF(normal_thick)
-                        item.setPen(old_pen)
+                for ann in self.viewer.annotations:
+                    if ann.item == self.selected_circle:
+                        pen = ann.item.pen()
+                        pen.setWidthF(ann.normal_thickness)
+                        ann.item.setPen(pen)
                         break
             except Exception:
-                # If the item was deleted or is invalid, just move on
                 pass
 
-        # 2. Find and highlight the new circle
-        for circle_item, c_ra, c_dec, _, normal_thick in self.viewer.circles:
-            # Use a small epsilon for float comparison of coordinates
-            if abs(c_ra - ra) < 1e-6 and abs(c_dec - dec) < 1e-6:
-                pen = circle_item.pen()
-                # Highlight by increasing thickness (e.g., by 50%)
-                pen.setWidthF(normal_thick * 1.5)
-                circle_item.setPen(pen)
-                
-                # Update the tracker
-                self.selected_circle = circle_item
-                
-                # Force the scene to redraw the highlight
+        # Find and highlight the new circle
+        for ann in self.viewer.annotations:
+            if abs(ann.ra - ra) < 1e-6 and abs(ann.dec - dec) < 1e-6:
+                pen = ann.item.pen()
+                pen.setWidthF(ann.normal_thickness * 1.5)
+                ann.item.setPen(pen)
+                self.selected_circle = ann.item
                 self.viewer.scene.update()
                 break
 
@@ -400,7 +459,11 @@ class ControlDock(QWidget):
             
             sky_coord = SkyCoord(ra * u.deg, dec * u.deg, frame='icrs')
             x, y = self.viewer.wcs.world_to_pixel(sky_coord)
-            
+            # Extract the first element if they are arrays
+            if isinstance(x, np.ndarray):
+                x = float(x.item() if x.size == 1 else x[0])
+                y = float(y.item() if y.size == 1 else y[0])
+
             # Use pathlib-style shape access
             img_height = self.viewer.original_image.shape[0]
             y = img_height - y
@@ -480,6 +543,34 @@ class ControlDock(QWidget):
         if self.dragging:
             self.handle_preview_drag(event.pos())
 
+        # Coordinate display — works independently of dragging
+        if not self.viewer or not self.viewer.wcs or self.viewer.original_image is None:
+            return
+        pm = self.preview_label.pixmap()
+        if not pm or pm.isNull():
+            return
+
+        # Map label pixel → full-resolution image pixel (same ratio used in handle_preview_drag)
+        scaled_w = pm.width()
+        scaled_h = pm.height()
+        image_w = self.viewer.last_pixmap.width()
+        image_h = self.viewer.last_pixmap.height()
+        img_x = event.pos().x() * (image_w / scaled_w)
+        img_y = event.pos().y() * (image_h / scaled_h)
+
+        # Guard: only update if the mapped position is inside the image
+        if not (0 <= img_x < image_w and 0 <= img_y < image_h):
+            return
+
+        # Apply the same FITS y-flip as in the main viewer's mouseMoveEvent
+        flipped_y = self.viewer.original_image.shape[0] - img_y
+
+        try:
+            ra, dec = self.viewer.wcs.pixel_to_world(img_x, flipped_y)
+            self.update_cursor_display(img_x, flipped_y, ra, dec)
+        except Exception:
+            pass
+
     def preview_mouse_release(self, event):
         if event.button() == Qt.LeftButton:
             self.dragging = False
@@ -502,17 +593,29 @@ class ControlDock(QWidget):
     def on_sunglasses_toggled(self, checked):
         pass
 
-    def on_plot_toggled(self):
-
-        if self.viewer and self.viewer.catalog_manager:
-            self.plot_dialog = PlotDialog(
-                self.viewer.catalog_manager, 
-                self.viewer, 
-                parent=self
-            )
-            self.plot_dialog.show()
+    def on_plot_toggled(self, checked):
+        if checked:
+            if self.viewer and self.viewer.catalog_manager:
+                # Close any existing dialog before creating a new one
+                if self.plot_dialog is not None:
+                    self.plot_dialog.close()
+                    self.plot_dialog = None
+                self.plot_dialog = PlotDialog(
+                    self.viewer.catalog_manager,
+                    self.viewer,
+                    parent=self
+                )
+                self.plot_dialog.finished.connect(self.on_plot_dialog_closed)
+                self.plot_dialog.show()
+            else:
+                print("Error: Could not locate ImageViewer or CatalogManager.")
+                self.plotPushButton.blockSignals(True)
+                self.plotPushButton.setChecked(False)
+                self.plotPushButton.blockSignals(False)
         else:
-            print("Error: Could not locate ImageViewer or CatalogManager.")
+            if self.plot_dialog is not None:
+                self.plot_dialog.close()
+                self.plot_dialog = None
 
 
     def on_plot_dialog_closed(self):

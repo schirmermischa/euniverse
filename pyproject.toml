@@ -4,17 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "euniverse"
-version = "0.9.1"
+version = "1.0.0"
 authors = [
-  { name="Mischa Schirmer", email="your@email.com" },
+  { name="Mischa Schirmer", email="schirmer@mpia.de" },
 ]
 description = "A comprehensive tool to visualize Euclid color images created with eummy, and associated catalogs"
 readme = "README.md"
 requires-python = ">=3.7"
-license = {text = "GPL-3.0-or-later"}
+license = {text = "MIT License"}
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "License :: OSI Approved :: MIT License",
     "Topic :: Scientific/Engineering :: Astronomy",
     "Intended Audience :: Science/Research",
 ]
@@ -26,7 +26,6 @@ dependencies = [
     "opencv-python",
     "scipy",
     "tifffile",
-    "requests",
     "eummy"
 ]
 

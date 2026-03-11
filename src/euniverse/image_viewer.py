@@ -1,229 +1,305 @@
-from PyQt5.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QFileDialog, QApplication, QMessageBox, QMenu, QGraphicsEllipseItem, QWidget, QListWidget, QPushButton, QVBoxLayout, QHBoxLayout, QLabel, QDialog, QStatusBar, QGraphicsRectItem, QGraphicsLineItem, QGraphicsItemGroup
-from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QFont, QCursor
-from PyQt5.QtCore import Qt, QPointF, QRectF, QPoint, QThread, pyqtSignal, QObject, QSize
-import tifffile
-import json
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# euniverse.py - A program to display MER colour images created with eummy
+
+# MIT License
+
+# Copyright (c) [2026] [Mischa Schirmer]
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""
+image_viewer.py — Main image display and interaction widget
+===========================================================
+ImageViewer is a QGraphicsView subclass that displays a Euclid MER tile TIFF
+and handles all user interaction on it.
+
+Responsibilities
+----------------
+  - TIFF loading via a background TiffLoader thread (see workers.py)
+  - Contrast adjustment engine (LUT-based full pass + viewport-crop preview)
+  - MER catalog overlay management (add / remove / toggle QGraphicsEllipseItems)
+  - User annotation circles (right-click to classify, left-click to select,
+    Delete key to remove); stored as Annotation dataclass instances (annotations.py)
+  - Mouse / keyboard / wheel event handling
+  - Zoom helpers and viewport navigation
+  - Distance measurement ruler (middle-mouse drag, drawn in drawForeground)
+  - PNG export delegated to ImageExporter (image_exporter.py)
+
+What is NOT here
+----------------
+  - File saving / PNG export  →  image_exporter.py  (ImageExporter)
+  - Background thread workers →  workers.py          (TiffLoader, CsvUploader)
+  - Annotation data model     →  annotations.py      (Annotation dataclass)
+  - Control panel UI          →  control_dock.py     (ControlDock)
+  - WCS math                  →  wcs_utils.py        (WCSConverter)
+"""
+
 import os
 import re
 import gc
+
 import numpy as np
 from PIL import Image
-from scipy.ndimage import zoom
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 
-from .catalog_manager import CatalogManager
-from .wcs_utils import WCSConverter
+from PyQt5.QtCore import Qt, QPointF, QRectF, QPoint, QThread, pyqtSignal, QObject, QSize, QSizeF
+from PyQt5.QtGui import (QPixmap, QImage, QPainter, QPen, QColor, QFont,
+                         QCursor, QTransform)
+from PyQt5.QtWidgets import (
+    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
+    QFileDialog, QApplication, QMessageBox, QMenu,
+    QGraphicsEllipseItem, QWidget, QListWidget, QPushButton,
+    QVBoxLayout, QHBoxLayout, QLabel, QDialog, QStatusBar,
+    QGraphicsRectItem, QGraphicsLineItem, QGraphicsItemGroup,
+)
 
-# Define NA as a recognized unit so the parser doesn't complain
+from .annotations     import Annotation
+from .catalog_manager import CatalogManager
+from .image_exporter  import ImageExporter
+from .workers         import TiffLoader
+from .wcs_utils       import WCSConverter
+
+# Astropy sometimes does not recognise the 'NA' unit used in Euclid FITS files.
+# Define it once at import time so every module that reads those files benefits.
 try:
-    # Try the version 5.x/6.x way
     u.def_unit('NA', u.dimensionless_unscaled, register_to_subclass=True)
 except (TypeError, ValueError):
-    # Fallback for Astropy < 5.0 OR Astropy >= 7.0
     u.def_unit('NA', u.dimensionless_unscaled)
 
 
 class ImageViewer(QGraphicsView):
-    # Add signal for load completion
-    image_loaded = pyqtSignal(np.ndarray, dict, str)  # Emits image, metadata, path
+    """
+    Central display widget for a Euclid MER tile.
+
+    Signals
+    -------
+    image_loaded(np.ndarray, dict, str)
+        Emitted after a TIFF has been successfully loaded and processed.
+        Carries (image_array, metadata_dict, file_path) for any listener
+        that needs to react to a new image (e.g. external analysis tools).
+    """
+
+    image_loaded = pyqtSignal(np.ndarray, dict, str)
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
 
     def __init__(self, main_window=None):
         super().__init__()
+
+        # ---- Qt scene setup ----
         self.main_window = main_window
         self.scene = QGraphicsScene()
-        self.scene.setItemIndexMethod(QGraphicsScene.BspTreeIndex) # for quicker display of graphics items (identifies objects that are currently visible in the shown area)
+        # BspTreeIndex speeds up hit-testing when many overlay items are present
+        self.scene.setItemIndexMethod(QGraphicsScene.BspTreeIndex)
         self.setScene(self.scene)
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
-        self.image_item = None
-        self.circles = []  # List of (QGraphicsEllipseItem, RA, Dec, classifier, normal_thickness)
-        self.wcs = None
-        self.filepath = None
-        self.dirpath = None
-        self.qimage = None
-        self.preview_image = None
-        self.control_dock = None
-        self.annotations = []
         self.setMouseTracking(True)
-        self.original_image = None
-        self.metadata = None
-        self.scale_factor = 1.0
-        self.last_pixmap = None
-        self.last_preview_pixmap = None
-        self.start_point_screen = QPoint()
-        self.end_point_screen = QPoint()
-        self.catalog_manager = None
-        self.is_displaying_preview = False
-        self.is_preview_updated = False
-        # Measurement attributes
-        self.is_measuring = False
-        self.measuring_line = None
-        self.measuring_line_h = None
-        self.measuring_line_v = None
-        self.start_point = None
-        self.end_point = None
-        self.current_point = None
-        self.rubber_band = None
-        self.start_ra_dec = None
-        self.angular_offset = None
-        self.offset_unit = None
-        self.horizontal_offset = None
-        self.horizontal_unit = None
-        self.vertical_offset = None
-        self.vertical_unit = None
-        self.crosshair = None
-        self.crosshair_ra = 0
-        self.crosshair_dec = 0
-        self.tileID = ""
-        self.title = ""
-        # Ensure the view can receive key events
         self.setFocusPolicy(Qt.StrongFocus)
-        # Connect scrollbar signals
-        self.horizontalScrollBar().valueChanged.connect(self.refresh_preview)
-        self.verticalScrollBar().valueChanged.connect(self.refresh_preview)
-        # Add status bar
-        self.status_bar = QStatusBar()
-        # Ensure status bar is added to the main window or layout later if needed
+        self.setStyleSheet(self._scrollbar_stylesheet())
+
+        # ---- Image state ----
+        self.image_item     = None   # QGraphicsPixmapItem currently in the scene
+        self.original_image = None   # Raw uint16 numpy array from TIFF
+        self.metadata       = None   # JSON metadata dict from TIFF ImageDescription tag
+        self.qimage         = None   # Full-res uint8 QImage (post-LUT), kept alive for raw-pointer safety
+        self.last_pixmap    = None   # Most recent full-image QPixmap
+        self.preview_image  = None   # Downscaled thumbnail numpy array for the dock navigator
+        self.wcs            = None   # WCSConverter for this tile
+        self.scale_factor   = 1.0   # Cumulative zoom factor; used by reset_zoom()
+        self.is_displaying_preview = False  # True while contrast slider preview crop is shown
+
+        # ---- File / tile identity ----
+        self.filepath   = None
+        self.dirpath    = None
+        self.tileID     = ""
+        self.title      = ""
+
+        # ---- Catalog and user annotations ----
+        self.catalog_manager = None
+        # annotations replaces the old 'circles' list of 5-tuples.
+        # Each element is an Annotation dataclass (see annotations.py).
+        self.annotations: list = []
+
+        # ---- Control dock reference (injected via set_control_dock) ----
+        self.control_dock = None
+
+        # ---- Background load thread ----
         self.load_thread = None
         self.load_worker = None
-        self.contrast_luts16 = {}  # Cache for LUTs
-        self.contrast_luts8 = {}  # Cache for LUTs
+
+        # ---- Contrast engine state ----
+        # Maps (min_val, max_val) -> uint8 numpy LUT array
+        self.contrast_luts16: dict = {}
+        # Keeps the numpy buffer alive while QImage holds a raw pointer to it
+        self._contrast_buffer         = None
+        # Viewport crop captured once on slider_pressed for the live preview path
+        self._preview_crop_raw        = None  # uint16 numpy view / downsampled copy
+        self._preview_crop_scene_pos  = None  # QPointF: top-left of crop in scene coords
+        self._preview_crop_scene_size = None  # QSizeF: scene extent when downsampled
+
+        # ---- Mouse interaction state ----
+        self.start_point        = None  # QPointF: scene pos at mouse-press
+        self.end_point          = None  # QPointF: scene pos at mouse-release
+        self.current_point      = None  # QPointF: scene pos updated on every move
+        self.start_point_screen = None   # set on left-press; None until first press
+        self.end_point_screen   = None
+        self.start_ra_dec       = None  # (ra, dec) cached at press for ruler + annotation
+        self.rubber_band        = None  # QGraphicsRectItem shown in screenshot mode
+        self.crosshair          = None  # QGraphicsItemGroup crosshair inside rubber-band
+        self.crosshair_ra       = 0.0
+        self.crosshair_dec      = 0.0
+        self.callback_on_selection = None  # called with QRectF after rubber-band drag
+
+        # ---- Rectangle-selection / screenshot mode ----
         self.rectangle_selection = False
-        self.rubber_band = None
-        self.selection_rect = None
-        self.callback_on_selection = None
+        self.selection_rect      = None
+
+        # ---- Distance measurement (middle-mouse drag) ----
+        self.is_measuring       = False
+        self.angular_offset     = None
+        self.offset_unit        = None
+        self.horizontal_offset  = None
+        self.horizontal_unit    = None
+        self.vertical_offset    = None
+        self.vertical_unit      = None
+
+        # ---- Sub-components ----
+        # ImageExporter handles all PNG save / screenshot operations
+        self.exporter   = ImageExporter(self)
+        self.status_bar = QStatusBar()
+
+        # Refresh the navigator thumbnail whenever the user scrolls
+        self.horizontalScrollBar().valueChanged.connect(self.refresh_preview)
+        self.verticalScrollBar().valueChanged.connect(self.refresh_preview)
+
         QApplication.setOverrideCursor(Qt.ArrowCursor)
-        self.setStyleSheet(self._get_scrollbar_stylesheet())
 
-    def _get_scrollbar_stylesheet(self):
-        # The color for the movable handle/slider
-        handle_color = "#87CEEB"  # Blue
+    # ------------------------------------------------------------------
+    # Scrollbar stylesheet
+    # ------------------------------------------------------------------
 
+    def _scrollbar_stylesheet(self) -> str:
+        """CSS string that gives the scroll bars a blue handle on a grey trough."""
+        h = "#87CEEB"
         return f"""
-            /* 1. Define the overall Scrollbar dimensions and background (Trough) */
-            QScrollBar:vertical {{
-                background: #E0E0E0; /* Set a recognizable light gray background for the trough */
-            }}
-            QScrollBar:horizontal {{
-                background: #E0E0E0; /* Set a recognizable light gray background for the trough */
-            }}
-
-            /* 2. Target the movable Handle (the Slider) and apply the blue color */
+            QScrollBar:vertical   {{ background: #E0E0E0; }}
+            QScrollBar:horizontal {{ background: #E0E0E0; }}
             QScrollBar::handle:vertical {{
-                background: {handle_color};
-                min-height: 20px;
-                border-radius: 6px; /* Half of the width to make it rounded */
+                background: {h}; min-height: 20px; border-radius: 6px;
             }}
             QScrollBar::handle:horizontal {{
-                background: {handle_color};
-                min-width: 20px;
-                border-radius: 6px; /* Half of the height to make it rounded */
+                background: {h}; min-width: 20px; border-radius: 6px;
             }}
-
-            /* 3. Remove default styling for arrows (optional but recommended) */
-            QScrollBar::add-line, QScrollBar::sub-line {{
-                border: none;
-                background: none;
-            }}
+            QScrollBar::add-line, QScrollBar::sub-line {{ border: none; background: none; }}
         """
 
-    def extract_tileID(self, filepath):
+    # ------------------------------------------------------------------
+    # Utility
+    # ------------------------------------------------------------------
+
+    def update_status(self, message: str, timeout: int = 5000):
+        """Push *message* to the main window status bar for *timeout* ms."""
+        if self.main_window:
+            self.main_window.statusBar().showMessage(message, timeout)
+
+    def set_main_window_title(self, title: str):
+        if self.main_window:
+            self.main_window.setWindowTitle(title)
+
+    def extract_tileID(self, filepath: str):
         """
-        Extracts the substring starting with 'TILE' and ending after the digit sequence,
-        stopping when a non-digit character is encountered.
-        
-        Returns:
-        - the raw segment (e.g., 'TILE101794875')
-        - the same segment with a space after 'TILE' (e.g., 'TILE 101794875')
+        Extract the TILE identifier from a Euclid TIFF filename.
+
+        Returns (raw, spaced) e.g. ('TILE101794875', 'TILE 101794875'),
+        or (None, None) if the pattern is not found.
         """
-        filename = os.path.basename(filepath)
-        match = re.search(r'(TILE\d+)\D', filename)
+        match = re.search(r'(TILE\d+)\D', os.path.basename(filepath))
         if match:
             raw = match.group(1)
-            spaced = raw.replace('TILE', 'TILE ')
-            return raw, spaced
-        else:
-            return None, None
-        
-    ###############################################
-    # File loading functions
-    ###############################################
+            return raw, raw.replace('TILE', 'TILE ')
+        return None, None
 
-    # Worker class for loading TIFF in a separate thread
-    class LoadWorker(QObject):
-        finished = pyqtSignal(np.ndarray, dict, str)  # Signal to emit image, metadata, path
-        error = pyqtSignal(str)  # Signal for errors
+    # ------------------------------------------------------------------
+    # Control dock wiring
+    # ------------------------------------------------------------------
 
-        def __init__(self, path):
-            super().__init__()
-            self.path = path
+    def set_control_dock(self, dock):
+        """
+        Inject the ControlDock and wire up all callbacks.
+        Called once from MainWindow after both widgets have been created.
+        """
+        self.control_dock = dock
+        dock.set_load_callback(self.open_file_dialog)
+        dock.set_slider_press_callback(self.capture_preview_crop)
+        dock.set_contrast_callback(self.apply_preview_contrast)
+        dock.set_full_contrast_callback(self.apply_contrast)
 
-        def run(self):
-            """
-            Loads the TIFF image and extracts metadata.
-            Emits the 'finished' signal with the image data, metadata, and path on success.
-            Emits the 'error' signal if an exception occurs.
-            """
-            try:
-                QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
-                with tifffile.TiffFile(self.path) as tif:
-                    image = tif.pages[0].asarray()
-                    if 'ImageDescription' not in tif.pages[0].tags:
-                        raise ValueError("No ImageDescription tag found in TIFF metadata")
-                    desc = tif.pages[0].tags['ImageDescription'].value
-                    try:
-                        metadata = json.loads(desc)
-                    except json.JSONDecodeError:
-                        raise ValueError("Invalid JSON in ImageDescription tag")
-                    self.finished.emit(image, metadata, self.path)
-                                    
-            except ValueError as ve:
-                self.error.emit(str(ve))
-                QApplication.restoreOverrideCursor()
-            except Exception as e:
-                self.error.emit(f"An unexpected error occurred: {str(e)}")
-                QApplication.restoreOverrideCursor()
+    def discard_preview_crop(self):
+        """
+        Release the temporary contrast-preview crop.
+        Called by ControlDock.slider_released so it does not poke
+        private attributes directly.
+        """
+        self._preview_crop_raw        = None
+        self._preview_crop_scene_pos  = None
+        self._preview_crop_scene_size = None
 
+    # ------------------------------------------------------------------
+    # File loading
+    # ------------------------------------------------------------------
 
-    def reset(self):
-        # 1. Clear UI components
-        if self.control_dock:
-            self.control_dock.coord_list.clear()
-            self.control_dock.set_black_squares()
-        
-        # 2. Clear visual overlays
-        self.clear_MER()
-        self.image_item = None
-        
-        # 3. Explicit Memory Cleanup
-        if self.catalog_manager:
-            self.catalog_manager.catalog = None # Release the large table data
-        self.catalog_manager = None
+    def open_file_dialog(self):
+        """Show a Qt file-open dialog and start loading the chosen TIFF."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select MER TILE TIFF", "",
+            "TIFF files (*TILE*.tif *TILE*.tiff)"
+        )
+        if path:
+            self.filepath = path
+            self.dirpath  = os.path.dirname(path)
+            self.load_image(path)
 
-        # 4. Further clearing
-        self.clear_measuring_state()
-        
-        if self.original_image is not None:
-            self.original_image = None # Release the large image array
-            
-        self.scene.clear() # Clear everything from the scene
-        gc.collect()
-            
+    def load_image(self, path: str):
+        """
+        Spin up a TiffLoader worker thread for *path*.
+        Any already-running load is cleanly aborted first to prevent
+        two threads from racing to call on_image_loaded.
+        """
+        if self.load_thread and self.load_thread.isRunning():
+            self.load_thread.quit()
+            self.load_thread.wait()
+            self.load_thread = None
+            self.load_worker = None
 
-    def load_image(self, path):
-        # Show status bar message
-#        self.status_bar.showMessage("Loading TIFF ... this will take a while")
-
-        # Create thread and worker
         self.load_thread = QThread()
-        self.load_worker = self.LoadWorker(path)
+        self.load_worker = TiffLoader(path)
         self.load_worker.moveToThread(self.load_thread)
 
-        # Connects signals
         self.load_thread.started.connect(self.load_worker.run)
         self.load_worker.finished.connect(self.load_thread.quit)
         self.load_worker.finished.connect(self.load_worker.deleteLater)
@@ -231,100 +307,154 @@ class ImageViewer(QGraphicsView):
         self.load_worker.error.connect(self.on_load_error)
         self.load_thread.start()
 
-    def on_image_loaded(self, image, metadata, path):
+    def on_image_loaded(self, image: np.ndarray, metadata: dict, path: str):
         """
-        Handles the image data after loading is complete.  This runs in the main thread.
-        """
+        Main-thread slot called by TiffLoader.finished.
 
+        Builds the initial contrast display, creates the navigator thumbnail,
+        and loads the matching MER catalog.
+        """
         try:
             self.reset()
-            
-            self.update_status("Processing TIFF ...")
+
+            self.update_status("Processing TIFF …")
             self.original_image = image
-            self.metadata = metadata
-            self.wcs = WCSConverter(self.metadata)
+            self.metadata       = metadata
+            self.wcs            = WCSConverter(metadata)
             if self.wcs is None:
                 raise ValueError("WCSConverter returned None")
 
             h, w = image.shape[:2]
+
+            # Build a downscaled navigator thumbnail (longest axis ≤ 1000 px)
             scale = min(1000 / max(h, w), 1.0)
             new_h, new_w = int(h * scale), int(w * scale)
-
-            if len(image.shape) == 3:
-                self.update_status("Making preview image ...")
-                if image.dtype == np.uint16:
-                    image_uint8 = (image // 256).astype(np.uint8)
-                else:
-                    image_uint8 = image.astype(np.uint8)
-                pil_img = Image.fromarray(image_uint8).resize((new_w, new_h), Image.LANCZOS)
+            if image.ndim == 3:
+                self.update_status("Building navigator thumbnail …")
+                img8    = (image >> 8).astype(np.uint8) if image.dtype == np.uint16 else image.astype(np.uint8)
+                pil_img = Image.fromarray(img8).resize((new_w, new_h), Image.LANCZOS)
                 self.preview_image = np.array(pil_img)
             else:
-                from scipy.ndimage import zoom
-                self.preview_image = zoom(image, scale, order=1)
+                from scipy.ndimage import zoom as scipy_zoom
+                self.preview_image = scipy_zoom(image, scale, order=1)
 
-            self.update_status("Adjusting contrast ...")
+            # Apply default full-range contrast and show the image
+            self.update_status("Applying contrast …")
             self.control_dock.max_slider.setValue(65535)
-            self.apply_contrast(0, 65535, full_image=True)
+            self.apply_contrast(0, 65535)
             self.centerOn(QPointF(w / 2, h / 2))
-            self.update_status("Getting preview ...")
-            self.get_visible_qimage_pixmap()
-            self.update_status("Getting preview done.")
 
+            # Populate the navigator with the current viewport crop
+            self.update_status("Updating navigator …")
+            self.get_visible_qimage_pixmap()
+
+            # Tile identity and MER catalog
             self.tileID, self.title = self.extract_tileID(path)
             if self.title:
                 self.set_main_window_title(f"Euniverse Explorer – {self.title}")
             if self.tileID:
-                self.update_status("Loading MER catalog ...")
-                self.catalog_manager = CatalogManager(self.tileID, self.wcs, os.path.dirname(path),
-                                                    image_viewer=self)  # Pass self
+                self.update_status("Loading MER catalog …")
+                self.catalog_manager = CatalogManager(
+                    self.tileID, self.wcs, os.path.dirname(path),
+                    image_viewer=self
+                )
             else:
-                print("No TILE number found in image filename")
                 self.catalog_manager = None
+                self.update_status("No TILE id in filename — catalog skipped.")
 
             self.default_image = path
-            self.image_loaded.emit(image, metadata, path)  # Emit signal
-            self.update_status(f"TIFF loaded, {self.catalog_manager.numsources} MER sources found.")
+            self.image_loaded.emit(image, metadata, path)
+            n = self.catalog_manager.numsources if self.catalog_manager else 0
+            self.update_status(f"TIFF loaded — {n} MER sources found.")
 
         except ValueError as ve:
             self.on_load_error(str(ve))
         except Exception as e:
-            self.on_load_error(f"An unexpected error occurred in on_image_loaded: {e}")
+            self.on_load_error(f"Unexpected error in on_image_loaded: {e}")
 
         QApplication.restoreOverrideCursor()
 
+    def on_load_error(self, message: str):
+        """Slot for TiffLoader.error and internal on_image_loaded exceptions."""
+        self.update_status(f"Error loading TIFF: {message}")
+        print(f"Error loading TIFF: {message}")
+        if self.load_thread:
+            self.load_thread.quit()
+            self.load_thread.wait()
+            self.load_thread = None
+        if self.load_worker:
+            self.load_worker.deleteLater()
+            self.load_worker = None
 
-    def on_load_error(self, error_msg):
-        self.update_status(f"Error loading TIFF: {error_msg}")
-        print(f"Error loading TIFF: {error_msg}")
-        self.load_thread.quit()  # Ensure thread is stopped on error
-        self.load_thread.wait()
-        self.load_worker.deleteLater()
+    # ------------------------------------------------------------------
+    # State reset
+    # ------------------------------------------------------------------
+
+    def reset(self):
+        """
+        Reset all viewer state in preparation for loading a new image.
+
+        Order matters:
+          0. Abort any in-flight background thread first.
+          1. Remove annotation circles before scene.clear() to avoid dangling
+             C++ wrappers (QGraphicsEllipseItem destroyed by scene.clear while
+             Python still holds a reference to the wrapper object → crash).
+          2. Remove MER overlays.
+          3. Release large numpy arrays so memory is reclaimed promptly.
+          4. Call scene.clear() — safe now that all items are removed.
+          5. Force a GC cycle.
+        """
+        # 0. Abort in-flight load
+        if self.load_thread and self.load_thread.isRunning():
+            self.load_thread.quit()
+            self.load_thread.wait()
+        self.load_thread = None
         self.load_worker = None
 
-    # Update open_file_dialog to use the threaded load_image
-    def open_file_dialog(self):
-        self.filepath, _ = QFileDialog.getOpenFileName(self, "Select MER TILE TIFF", "", "TIFF files (*TILE*.tif *TILE*.tiff)")
-        if self.filepath:
-            self.dirpath = os.path.dirname(self.filepath)
-            self.load_image(self.filepath)
+        # 1. Annotation circles (must precede scene.clear)
+        self.clear_annotations()
+        if self.control_dock:
+            self.control_dock.set_black_squares()
 
-    def update_status(self, message, timeout=5000):
-        if self.main_window:
-            self.main_window.statusBar().showMessage(message, timeout)
+        # 2. MER overlays
+        self.clear_MER()
+        self.image_item = None
 
-    def set_main_window_title(self, title):
-        if self.main_window:
-            self.main_window.setWindowTitle(title)
+        # 3. Catalog reference
+        if self.catalog_manager:
+            self.catalog_manager.catalog = None
+        self.catalog_manager = None
 
-    ###############################################
-    # MER catalog display
-    ###############################################
+        # 4. Measurement state
+        self.clear_measuring_state()
+
+        # 5. Large arrays and contrast buffers
+        self.original_image           = None
+        self._contrast_buffer         = None
+        self._preview_crop_raw        = None
+        self._preview_crop_scene_pos  = None
+        self._preview_crop_scene_size = None
+
+        # 6. Scene
+        self.scene.clear()
+        gc.collect()
+
+    # ------------------------------------------------------------------
+    # MER catalog overlay
+    # ------------------------------------------------------------------
+
     def toggle_MER(self):
+        """
+        Show or hide the MER catalog ellipse overlays.
+
+        First call builds the item list from CatalogManager and adds them
+        to the scene.  Subsequent calls flip their visibility flag.
+        """
         if self.catalog_manager is None or self.original_image is None:
             return
 
-        # Case A: List is empty - Load from scratch
         if not self.catalog_manager.MER_items:
+            # First activation — build and add all ellipses
             self.catalog_manager.get_MER(self.original_image.shape[0])
             self.setUpdatesEnabled(False)
             try:
@@ -334,961 +464,863 @@ class ImageViewer(QGraphicsView):
             finally:
                 self.setUpdatesEnabled(True)
                 self.scene.update()
-            return
-
-        # Case B: List exists - Flip the visibility
-        # Check the first item to see if we are currently hiding or showing
-        is_now_visible = not self.catalog_manager.MER_items[0].isVisible()
-    
-        for ellipse in self.catalog_manager.MER_items:
-            ellipse.setVisible(is_now_visible)
-    
-        self.scene.update()
+        else:
+            # Toggle existing items
+            new_vis = not self.catalog_manager.MER_items[0].isVisible()
+            for ellipse in self.catalog_manager.MER_items:
+                ellipse.setVisible(new_vis)
+            self.scene.update()
 
     def clear_MER(self):
-        """Permanently removes MER items so the list is empty again."""
+        """
+        Permanently remove all MER overlay items and reset the item list.
+        The next toggle_MER call will rebuild everything from scratch.
+        """
         if self.catalog_manager and self.catalog_manager.MER_items:
             for ellipse in self.catalog_manager.MER_items:
                 if ellipse.scene() == self.scene:
                     self.scene.removeItem(ellipse)
-        
-            # This ensures 'if not self.catalog_manager.MER_items' returns True next time
             self.catalog_manager.MER_items = []
             self.scene.update()
 
-
-    def display_selected_MER(self, object_ids):
-        """Standardized method for Plotter/Lasso input."""
+    def display_selected_MER(self, object_ids: list):
+        """
+        Show ellipses for a specific subset of catalog IDs.
+        Called by CatalogManager.handle_selected_objects after a lasso selection
+        in the scatter plot.
+        """
         if not self.catalog_manager or self.original_image is None:
             return
-
-        # Always clear old overlays first
         self.clear_selected_MER()
-
-        # Generate new shapes (CatalogManager returns the items and stores them)
-        image_height = self.original_image.shape[0]
-        new_items = self.catalog_manager.get_selected_MER(object_ids, image_height)
-
-        if new_items:
+        items = self.catalog_manager.get_selected_MER(object_ids, self.original_image.shape[0])
+        if items:
             self.setUpdatesEnabled(False)
             try:
-                for item in new_items:
+                for item in items:
                     self.scene.addItem(item)
                     item.setVisible(True)
-                
-                # Center view on the first object of the selection
-                self.centerOn(new_items[0].rect().center())
+                self.centerOn(items[0].rect().center())
             finally:
                 self.setUpdatesEnabled(True)
                 self.scene.update()
 
     def clear_selected_MER(self):
-        """Cleanly removes selected ellipses from the scene."""
+        """Remove the lasso-selected subset of ellipses from the scene."""
         if self.catalog_manager and self.catalog_manager.selected_MER_items:
             for item in self.catalog_manager.selected_MER_items:
                 if item.scene() == self.scene:
                     self.scene.removeItem(item)
-            # Clear the list in the manager
             self.catalog_manager.selected_MER_items = []
             self.scene.update()
 
     def toggle_selected_MER(self):
-        """Toggles visibility of existing selection without re-fetching data."""
+        """Toggle visibility of the current lasso-selected subset."""
         items = getattr(self.catalog_manager, 'selected_MER_items', [])
-        if not items:
-            return
+        if items:
+            new_vis = not items[0].isVisible()
+            for item in items:
+                item.setVisible(new_vis)
+            self.scene.update()
 
-        new_vis = not items[0].isVisible()
-        for item in items:
-            item.setVisible(new_vis)
-        self.scene.update()
+    # ------------------------------------------------------------------
+    # User annotation circles
+    # ------------------------------------------------------------------
 
+    def clear_annotations(self):
+        """
+        Remove all user annotation circles from the scene and reset the list.
 
-    ###############################################
-    # Process image
-    ###############################################
+        Must be called before scene.clear() to prevent dangling C++ object
+        wrappers.  sip.isdeleted() is used as a defensive backstop in case
+        some items were already destroyed by an earlier scene.clear().
+        """
+        import sip
+        for ann in self.annotations:
+            try:
+                if not sip.isdeleted(ann.item) and ann.item.scene() == self.scene:
+                    self.scene.removeItem(ann.item)
+            except RuntimeError:
+                pass  # C++ object already gone — nothing to do
+        self.annotations = []
+
+        if self.control_dock:
+            self.control_dock.selected_circle = None
+            self.control_dock.coord_list.clear()
+            try:
+                self.control_dock.submit_targets_button.setEnabled(False)
+                self.control_dock.save_targets_button.setEnabled(False)
+            except RuntimeError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Navigator thumbnail extraction
+    # ------------------------------------------------------------------
+
     def get_visible_qimage_pixmap(self):
         """
-        Determines the currently visible area in a QGraphicsView, extracts that area
-        from the loaded 8-bit RGB QImage displayed in the scene, and stores it as an
-        internal numpy array in the ImageViewer class.
-        We use this new image to quickly display interactive contrast changes
+        Extract the currently visible scene area from self.qimage and store
+        it as a numpy array in self.preview_image.
 
-        Args:
-        view: The QGraphicsView instance displaying the 8-bit RGB QImage.
+        Called after the initial load and after each full contrast pass so
+        the navigator thumbnail always reflects the current display state.
+        Operates on the rendered uint8 QImage so the thumbnail matches exactly
+        what is shown on screen.
         """
-        if not self.scene:
+        if not self.scene or self.qimage is None:
             return
 
-        self.is_preview_updated = False
-        
-        # Get the visible rectangle in scene coordinates
-        visible_rect_scene = self.mapToScene(self.viewport().rect()).boundingRect()
-
-        # Find the QGraphicsPixmapItem containing the image
-        image_item = None
-        for item in self.scene.items():
-            if isinstance(item, QGraphicsPixmapItem):
-                image_item = item
-                break
-        if not image_item:
+        visible_rect = self.mapToScene(self.viewport().rect()).boundingRect()
+        image_item   = next(
+            (i for i in self.scene.items() if isinstance(i, QGraphicsPixmapItem)), None
+        )
+        if image_item is None:
             return
 
-        # Get the bounding rect of the image item in scene coordinates
-        image_rect_scene = image_item.boundingRect()
-
-        # Calculate the intersection of the visible area and the image area
-        intersection_rect_scene = visible_rect_scene.intersected(image_rect_scene)
-
-        if intersection_rect_scene.isEmpty():
+        intersection = visible_rect.intersected(image_item.boundingRect())
+        if intersection.isEmpty():
             return
 
-        # Map the intersection rectangle from scene coordinates to image coordinates
-        top_left_scene = intersection_rect_scene.topLeft()
-        bottom_right_scene = intersection_rect_scene.bottomRight()
-        center_scene = intersection_rect_scene.center()
+        tl = image_item.mapFromScene(intersection.topLeft()).toPoint()
+        br = image_item.mapFromScene(intersection.bottomRight()).toPoint()
+        x  = max(0, tl.x())
+        y  = max(0, tl.y())
+        w  = min(br.x(), self.qimage.width()  - 1) - x + 1
+        h  = min(br.y(), self.qimage.height() - 1) - y + 1
 
-        top_left_image = image_item.mapFromScene(top_left_scene).toPoint()
-        bottom_right_image = image_item.mapFromScene(bottom_right_scene).toPoint()
-        # center_image = image_item.mapFromScene(bottom_right_scene).toPoint()
-        center_image = image_item.mapFromScene(center_scene).toPoint()
-
-        # Ensure the extracted rectangle is within the bounds of the original image
-        x = max(0, top_left_image.x())
-        y = max(0, top_left_image.y())
-
-        width = min(bottom_right_image.x(), self.qimage.width() - 1) - x + 1
-        height = min(bottom_right_image.y(), self.qimage.height() - 1) - y + 1
-
-        if width <= 0 or height <= 0:
+        if w <= 0 or h <= 0:
             return
 
-        # Extract the visible portion as a new QImage
-        qimg = self.qimage.copy(x, y, width, height)
+        qimg = self.qimage.copy(x, y, w, h)
+        fmt  = qimg.format()
 
-        # Convert the QImage to a NumPy array (assuming 8-bit RGB - likely Format_RGB32 or Format_RGB888)
-        format = qimg.format()
-        if format == QImage.Format_RGB32 or format == QImage.Format_ARGB32:
+        if fmt in (QImage.Format_RGB32, QImage.Format_ARGB32):
             ptr = qimg.bits()
             ptr.setsize(qimg.byteCount())
-            arr = np.array(ptr).reshape(qimg.height(), qimg.width(), 4)  # BGRA
-            self.preview_image = arr[:, :, 0:3][:, :, ::-1]  # Convert BGRA to RGB
-            self.is_preview_updated = True
-        elif format == QImage.Format_RGB888:
-            ptr = qimg.bits()
+            arr = np.array(ptr).reshape(qimg.height(), qimg.width(), 4)
+            self.preview_image = arr[:, :, :3][:, :, ::-1]   # BGRA → RGB
+        elif fmt == QImage.Format_RGB888:
+            ptr    = qimg.bits()
             ptr.setsize(qimg.byteCount())
-            self.preview_image = np.array(ptr).reshape(qimg.height(), qimg.width(), 3) # RGB
-            self.is_preview_updated = True
+            stride = qimg.bytesPerLine()
+            arr    = np.frombuffer(ptr, dtype=np.uint8).reshape(qimg.height(), stride)
+            self.preview_image = arr[:, :qimg.width() * 3].reshape(qimg.height(), qimg.width(), 3)
         else:
-            print(f"Warning: Unsupported QImage format for RGB NumPy conversion: {format}")
+            print(f"Warning: unsupported QImage format {fmt} in get_visible_qimage_pixmap")
             self.preview_image = None
 
-        
-    def create_contrast_lut(self, min_val, max_val, input_dtype, output_dtype=np.uint8):
-        lut = np.arange(np.iinfo(input_dtype).max + 1, dtype=np.float32)
-        diff = max_val - min_val
+    # ------------------------------------------------------------------
+    # Contrast engine
+    # ------------------------------------------------------------------
+    #
+    # Two modes:
+    #
+    # FULL mode (slider released / initial load)
+    #   apply_contrast(min, max)
+    #   Builds a uint16→uint8 LUT (cached), applies lut[original_image],
+    #   stores self.qimage, updates the scene pixmap, resets sceneRect.
+    #
+    # PREVIEW mode (slider held)
+    #   1. capture_preview_crop() — called once on slider_pressed.
+    #      Slices the visible region from original_image (zero-copy view),
+    #      optionally nearest-neighbour downsamples to viewport size.
+    #   2. apply_preview_contrast(min, max) — called on every slider tick.
+    #      Stretches the crop with a reusable float32 scratch buffer,
+    #      updates image_item pixmap in-place. sceneRect never changes.
+    # ------------------------------------------------------------------
+
+    _MAX_LUT_CACHE = 64   # Evict oldest entries beyond this many cached LUTs
+
+    def _trim_lut_cache(self, cache: dict):
+        """Evict oldest cache entries when cache exceeds _MAX_LUT_CACHE entries."""
+        while len(cache) > self._MAX_LUT_CACHE:
+            cache.pop(next(iter(cache)))
+
+    def create_contrast_lut(self, min_val, max_val,
+                            input_dtype, output_dtype=np.uint8) -> np.ndarray:
+        """
+        Build a linear-stretch lookup table: input_dtype values → uint8 [0..255].
+
+        Values below min_val → 0, above max_val → 255.
+        The 65 536-entry float32 intermediate fits in L2 cache, so plain numpy
+        is sufficient here.
+        """
+        n    = np.iinfo(input_dtype).max + 1
+        diff = float(max_val - min_val)
         if diff == 0:
-            lut.fill(255)
+            return np.full(n, 255, dtype=output_dtype)
+        indices = np.arange(n, dtype=np.float32)
+        return np.clip((indices - min_val) * (255.0 / diff), 0, 255).astype(output_dtype)
+
+    def capture_preview_crop(self):
+        """
+        Slice the currently visible viewport region from original_image and
+        cache it in _preview_crop_raw for use by apply_preview_contrast.
+
+        Called once on slider_pressed before any dragging starts, so each tick
+        operates on the same crop without re-reading the image.
+
+        If the crop is larger than the physical viewport (user is zoomed out),
+        it is nearest-neighbour downsampled to viewport pixel dimensions.
+        This keeps per-tick work proportional to the pixels actually rendered,
+        regardless of zoom level.
+        """
+        if self.original_image is None or self.image_item is None:
+            return
+
+        # Compute crop bounds, clamped to image extent
+        visible_rect = self.mapToScene(self.viewport().rect()).boundingRect()
+        img_h, img_w = self.original_image.shape[:2]
+        crop_rect    = visible_rect.intersected(QRectF(0, 0, img_w, img_h))
+        if crop_rect.isEmpty():
+            return
+
+        x0 = max(0, int(crop_rect.left()))
+        y0 = max(0, int(crop_rect.top()))
+        x1 = min(img_w, int(crop_rect.right())  + 1)
+        y1 = min(img_h, int(crop_rect.bottom()) + 1)
+
+        crop = self.original_image[y0:y1, x0:x1]   # zero-copy numpy view
+
+        # Downsample to viewport resolution when zoomed out
+        vp    = self.viewport()
+        dpr   = vp.devicePixelRatio() if hasattr(vp, 'devicePixelRatio') else 1.0
+        vp_h  = vp.height() * dpr
+        vp_w  = vp.width()  * dpr
+        crop_h, crop_w = crop.shape[:2]
+        scale = min(vp_h / crop_h, vp_w / crop_w, 1.0)
+
+        if scale < 1.0:
+            new_h   = max(1, int(round(crop_h * scale)))
+            new_w   = max(1, int(round(crop_w * scale)))
+            # Integer index arrays give nearest-neighbour without cv2/scipy
+            row_idx = (np.arange(new_h) * (crop_h / new_h)).astype(np.intp)
+            col_idx = (np.arange(new_w) * (crop_w / new_w)).astype(np.intp)
+            # np.ix_ produces a copy — intentional; _preview_float_buf must not
+            # alias original_image memory
+            crop = crop[np.ix_(row_idx, col_idx)]
+            self._preview_crop_scene_size = QSizeF(x1 - x0, y1 - y0)
         else:
-            lut = np.clip((lut - min_val) / diff, 0, 1)
-        lut = (255 * lut).astype(output_dtype)
-        return lut
-    
-    def apply_contrast_lut(self, image, lut):
-        """Applies contrast adjustment using a lookup table."""
-        return lut[image]
+            self._preview_crop_scene_size = None   # 1:1, no transform needed
 
+        self._preview_crop_raw       = crop
+        self._preview_crop_scene_pos = QPointF(x0, y0)
 
-    def apply_contrast(self, min_val, max_val, full_image=False):
+    def apply_preview_contrast(self, min_val: int, max_val: int):
+        """
+        Stretch _preview_crop_raw in-place and update image_item without
+        touching sceneRect, preserving scroll position and zoom level.
+
+        Key implementation detail: the uint16 → float32 widening MUST happen
+        before the subtraction.  Using casting='unsafe' in np.subtract would
+        evaluate (uint16 - min_val) in uint16 arithmetic first, causing wrap-
+        around for pixels below min_val (e.g. 1000 - 5000 → 61536).
+        Instead we widen with np.copyto first, then do arithmetic in float32.
+        """
+        if self._preview_crop_raw is None:
+            return
+
+        crop = self._preview_crop_raw
+        diff = float(max_val - min_val)
+        h, w = crop.shape[:2]
+        c    = 3 if crop.ndim == 3 else 1
+
+        # Allocate or reuse the float32 scratch buffer
+        if (not hasattr(self, '_preview_float_buf') or
+                self._preview_float_buf.shape != crop.shape):
+            self._preview_float_buf = np.empty(crop.shape, dtype=np.float32)
+
+        if diff == 0:
+            out = np.full(crop.shape, 255, dtype=np.uint8)
+        else:
+            scale = 255.0 / diff
+            np.copyto(self._preview_float_buf, crop, casting='unsafe')  # uint16 → float32
+            self._preview_float_buf -= min_val   # in-place; no extra allocation
+            self._preview_float_buf *= scale
+            np.clip(self._preview_float_buf, 0, 255, out=self._preview_float_buf)
+            out = self._preview_float_buf.astype(np.uint8)  # final copy for QImage
+
+        stride = c * w
+        # Keep buffer alive — QImage holds a raw pointer, not a copy
+        self._contrast_buffer = out
+        qimg   = QImage(self._contrast_buffer.data, w, h, stride,
+                        QImage.Format_RGB888 if c == 3 else QImage.Format_Grayscale8)
+        pixmap = QPixmap.fromImage(qimg)
+
+        self.image_item.setPixmap(pixmap)
+        self.image_item.setPos(self._preview_crop_scene_pos)
+
+        # If the crop was downsampled, scale the item to cover its scene extent
+        if self._preview_crop_scene_size is not None:
+            sx = self._preview_crop_scene_size.width()  / w
+            sy = self._preview_crop_scene_size.height() / h
+            self.image_item.setTransform(QTransform.fromScale(sx, sy))
+        else:
+            self.image_item.setTransform(QTransform())   # identity
+
+        self.is_displaying_preview = True
+
+    def apply_contrast(self, min_val: int, max_val: int):
+        """
+        Full-image LUT pass: build / look up a uint16→uint8 LUT, apply it to
+        original_image, store the result as self.qimage, and update the scene.
+
+        Called on slider release and on initial image load.
+        Always restores image_item to position (0,0) and rebuilds sceneRect.
+        """
         if self.original_image is None:
             return
 
-        if full_image:
-            image = self.original_image
-            input_dtype = image.dtype
-            output_dtype = np.uint8
-            lut_key = (min_val, max_val, input_dtype.name, output_dtype.__name__)
-            if lut_key not in self.contrast_luts16:
-                self.contrast_luts16[lut_key] = self.create_contrast_lut(min_val, max_val, input_dtype, output_dtype)
-            lut = self.contrast_luts16[lut_key]
-            
-        else:
-            # in 8-bit mode for quick preview
-            if not self.is_preview_updated:
-                self.get_visible_qimage_pixmap()
-            min_val = min_val / 255
-            max_val = max_val / 255
-            image = self.preview_image
-            input_dtype = image.dtype
-            output_dtype = np.uint8
-            lut_key = (min_val, max_val, input_dtype.name, output_dtype.__name__)
-            if lut_key not in self.contrast_luts8:
-                self.contrast_luts8[lut_key] = self.create_contrast_lut(min_val, max_val, input_dtype, output_dtype)
-            lut = self.contrast_luts8[lut_key]
-            
-        image = self.apply_contrast_lut(image, lut)
-        h, w = image.shape[:2]
-        c = 3 if len(image.shape) == 3 else 1
-        stride = c * w
-        
-        self.qimage = QImage(image.data, w, h, stride,
-                             QImage.Format_RGB888 if c == 3 else QImage.Format_Grayscale8)
-        pixmap = QPixmap.fromImage(self.qimage)
+        lut_key = (min_val, max_val)
+        if lut_key not in self.contrast_luts16:
+            self.contrast_luts16[lut_key] = self.create_contrast_lut(
+                min_val, max_val, self.original_image.dtype, np.uint8
+            )
+            self._trim_lut_cache(self.contrast_luts16)
+        lut = self.contrast_luts16[lut_key]
 
-        if full_image:
-            self.last_pixmap = pixmap
-            self.is_displaying_preview = False
-        else:
-            self.last_preview_pixmap = pixmap
-            self.last_pixmap = pixmap
-            self.is_displaying_preview = True
-            
+        stretched = lut[self.original_image]   # uint8, same shape as original_image
+        h, w      = stretched.shape[:2]
+        c         = 3 if stretched.ndim == 3 else 1
+        stride    = c * w
+
+        # Keep buffer alive — QImage does NOT copy the data
+        self._contrast_buffer = stretched
+        self.qimage = QImage(
+            self._contrast_buffer.data, w, h, stride,
+            QImage.Format_RGB888 if c == 3 else QImage.Format_Grayscale8
+        )
+        pixmap           = QPixmap.fromImage(self.qimage)
+        self.last_pixmap = pixmap
+        self.is_displaying_preview = False
+
         if self.image_item:
             self.image_item.setPixmap(pixmap)
+            self.image_item.setPos(0, 0)
+            self.image_item.setTransform(QTransform())   # clear any preview scale
         else:
             self.image_item = QGraphicsPixmapItem(pixmap)
             self.scene.addItem(self.image_item)
 
         self.setSceneRect(QRectF(0, 0, w, h))
 
-        # Only update the control dock's preview if we are NOT displaying the preview in the main view
-        if self.control_dock and not self.is_displaying_preview:
-            self.control_dock.update_preview(self.last_pixmap)
-
-
-    def set_control_dock(self, dock):
-        """
-        Connects the control dock to this image viewer and wires up all necessary callbacks
-        including contrast sliders and load image functionality.
-        """
-        self.control_dock = dock
-        
-        # Callback for loading an image
-        self.control_dock.set_load_callback(self.open_file_dialog)
-        
-        # Live contrast adjustment (called while slider is moving)
-        def preview_contrast(min_val, max_val):
-            if self.original_image is not None:
-                self.apply_contrast(min_val, max_val, full_image=False)
-                
-        # Full contrast computation (called after slider is released)
-        def final_contrast(min_val, max_val):
-            if self.original_image is not None:
-                self.apply_contrast(min_val, max_val, full_image=True)
-
-        self.control_dock.set_contrast_callback(preview_contrast)
-        self.control_dock.set_full_contrast_callback(final_contrast)
-
-
-    # Display a cross-hair in selection rectangles
-    def create_crosshair(self, parent_item):
-        # Crosshair dimensions
-        length = 5.0
-        
-        # Pen style for the crosshair
-        crosshair_pen = QPen(QColor("red"), 1, Qt.SolidLine)
-        
-        # 1. Vertical line: from (0, -length) to (0, length)
-        v_line = QGraphicsLineItem(0, -length, 0, length)
-        v_line.setPen(crosshair_pen)
-        
-        # 2. Horizontal line: from (-length, 0) to (length, 0)
-        h_line = QGraphicsLineItem(-length, 0, length, 0)
-        h_line.setPen(crosshair_pen)
-        
-        # 3. Create a QGraphicsItemGroup to hold both lines
-        # This makes it easy to move the whole crosshair together
-        crosshair_group = QGraphicsItemGroup(parent_item)
-        crosshair_group.addToGroup(v_line)
-        crosshair_group.addToGroup(h_line)
-        
-        # The crosshair is created, but it won't be positioned until the 
-        # rectangle size is defined (usually in mouseMoveEvent).
-        # We set its initial position (relative to the parent) to the start point
-        # In a typical setup, the parent_item (rubber band) is positioned 
-        # at the start point.
-        crosshair_group.setPos(0, 0) 
-        
-        return crosshair_group
-
-    ############################################################
-    # Event handling
-    ############################################################
-    def mousePressEvent(self, event):
-        scene_pos = self.mapToScene(event.pos())
-        self.start_point = scene_pos
-        
-        # Calculate WCS of click position and store it for MouseMoveEvent
-        if self.wcs and self.original_image is not None:
-            flipped_y = self.original_image.shape[0] - scene_pos.y()
-            self.start_ra_dec = self.wcs.pixel_to_world(scene_pos.x(), flipped_y)
- 
-        # 1. Screenshotting a sub-area
-        if self.rectangle_selection:
-            self.rubber_band = QGraphicsRectItem(QRectF(self.start_point, QPointF()))
-            pen = QPen(QColor("white"), 1, Qt.DashLine)
-            self.rubber_band.setPen(pen)
-            self.scene.addItem(self.rubber_band)
-            # Create crosshair; don't add it yet (done in mousemove event)
-            self.crosshair = self.create_crosshair(self.rubber_band)
-            return   # Early exit; also: don't let PyQt interpret the event further in super()
-
-        # 2. Left button logic
-        if event.button() == Qt.LeftButton:
-            self.start_point_screen = event.pos()  # Store press position for click detection
-
-        # 3. Middle button logic
-        elif event.button() == Qt.MidButton:
-            self.is_measuring = True
-            self.setDragMode(QGraphicsView.NoDrag)
-            self.viewport().update()
-            return 
-
-        # 4. Right button logic
-        elif event.button() == Qt.RightButton:
-            # Check if click is on an existing circle and if so, remove that circle
-            for circle, ra, dec, classifier, normal_thickness in self.circles[:]:
-                circle_rect = circle.rect()
-                circle_center = circle_rect.center()
-                distance = ((scene_pos.x() - circle_center.x())**2 + (scene_pos.y() - circle_center.y())**2)**0.5
-                if distance <= 10:
-                    self.scene.removeItem(circle)
-                    self.circles.remove((circle, ra, dec, classifier, normal_thickness))
-                    if self.control_dock:
-                        self.control_dock.update_coord_list(self.circles)
-                        if self.control_dock.selected_circle == circle:
-                            self.control_dock.selected_circle = None
-                    self.viewport().update()
-                    return
-
-            # Show context menu
-            menu = QMenu(self)
-            gl_lens = menu.addAction("GL: lens")
-            gl_arc = menu.addAction("GL: arc")
-            gl_multi = menu.addAction("GL: multiple image")
-            gl_einstein = menu.addAction("GL: Einstein ring")
-            gl_dspl = menu.addAction("GL: DSPL")
-            menu.addSeparator()
-            agn_seyfert = menu.addAction("AGN: Seyfert 1")
-            agn_outflow = menu.addAction("AGN: outflow")
-            menu.addSeparator()
-            gx_emline = menu.addAction("Gx: Emissionline")
-            gx_ring = menu.addAction("Gx: Ring")
-            gx_polar = menu.addAction("Gx: Polar ring")
-            gx_stream = menu.addAction("Gx: Stream")
-            gx_merger = menu.addAction("Gx: Merger")
-            gx_irregular = menu.addAction("Gx: Irregular")
-            gx_dwarf = menu.addAction("Gx: Dwarf")
-            gx_weird = menu.addAction("Gx: weird")
-            gl_lens.setData({"gl": True})
-            gl_arc.setData({"gl": True})
-            gl_multi.setData({"gl": True})
-            gl_einstein.setData({"gl": True})
-            gl_dspl.setData({"gl": True})
-            agn_seyfert.setData({"agn": True})
-            agn_outflow.setData({"agn": True})
-            gx_emline.setData({"gx": True})
-            gx_ring.setData({"gx": True})
-            gx_polar.setData({"gx": True})
-            gx_stream.setData({"gx": True})
-            gx_merger.setData({"gx": True})
-            gx_irregular.setData({"gx": True})
-            gx_dwarf.setData({"gx": True})
-            gx_weird.setData({"gx": True})
-            action = menu.exec_(self.mapToGlobal(event.pos()))
-            if action and self.wcs and self.original_image is not None:
-                classifier = action.text()
-                if classifier.startswith("GL"):
-                    color = QColor(0, 200, 255)  # Bright blue
-                elif classifier.startswith("AGN"):
-                    color = QColor(220, 220, 0)  # Yellow
-                else:  # Gx
-                    color = QColor(255, 50, 50)  # Red
-                normal_thickness = 2.0
-                circle = QGraphicsEllipseItem(scene_pos.x() - 10, scene_pos.y() - 10, 20, 20)
-                circle.setPen(QPen(color, normal_thickness))
-                circle.setZValue(10)
-                self.scene.addItem(circle)
-                self.circles.append((circle, self.start_ra_dec[0], self.start_ra_dec[1], classifier, normal_thickness))
-                if self.control_dock:
-                    self.control_dock.update_coord_list(self.circles)
-                self.viewport().update()
-
-        # let PyQt interpret the event further
-        super().mousePressEvent(event)
-
-        
-    def mouseMoveEvent(self, event):
-        """
-        Complete mouse tracking routine. Corrected to use 'is_measuring' 
-        to match the ImageViewer class attributes.
-        """
-        super().mouseMoveEvent(event)
-
-        if not self.wcs or not self.control_dock or self.original_image is None:
-            return
-
-        # Setup
-        self.current_point = self.mapToScene(event.pos())    # also used in the virtual hook drawForeground()
-        flipped_y =  self.original_image.shape[0] - self.current_point.y()      # FITS is flipped in vertical direction
-        ra, dec = None, None  # in case pointer is outside image area
-        
-        # Magnifier always follows the mouse
-        self.control_dock.update_magnifier(self.current_point)
-
-        # Coordinate tracking
-        if self.sceneRect().contains(self.current_point):
-            try:
-                ra, dec = self.wcs.pixel_to_world(self.current_point.x(), flipped_y)
-                self.control_dock.update_cursor_display(self.current_point.x(), flipped_y, ra, dec)
-            except: pass
-        else:
-            self.control_dock.update_cursor_display(None, None, None, None)
-
-        # If screenshotting a sub-area
-        if self.rectangle_selection and self.rubber_band:
-            rect = QRectF(self.start_point, self.current_point).normalized()   # normalized() removes negative signs
-            self.rubber_band.setRect(rect)
-            if self.crosshair and self.crosshair.scene():
-                self.crosshair.setPos(rect.center())
-                ch_x = rect.center().x()
-                ch_y = self.original_image.shape[0] - rect.center().y()
-                self.crosshair_ra, self.crosshair_dec = self.wcs.pixel_to_world(ch_x, ch_y) # remember for later use in save_area_selection
-            return
-
-        # 3. MEASURING LOGIC
-        # Measuring distances in image (middle-mouse-button drag)
-        if self.is_measuring and self.start_point and ra is not None and dec is not None:
-            try:
-                start_coord = SkyCoord(self.start_ra_dec[0] * u.deg, self.start_ra_dec[1] * u.deg, frame='icrs')
-                end_coord = SkyCoord(ra * u.deg, dec * u.deg, frame='icrs')
-                angular_offset_deg = start_coord.separation(end_coord).to(u.deg).value
-                if angular_offset_deg * 3600 < 60:
-                    self.angular_offset = angular_offset_deg * 3600
-                    self.offset_unit = "\""
-                elif angular_offset_deg < 1:
-                    self.angular_offset = angular_offset_deg * 60
-                    self.offset_unit = "\'"
-                else:
-                    self.angular_offset = None
-                    self.offset_unit = None
-                horizontal_coord = SkyCoord(ra * u.deg, self.start_ra_dec[1] * u.deg, frame='icrs')
-                horizontal_offset_deg = start_coord.separation(horizontal_coord).to(u.deg).value
-                if horizontal_offset_deg * 3600 < 60:
-                    self.horizontal_offset = horizontal_offset_deg * 3600
-                    self.horizontal_unit = "\""
-                elif horizontal_offset_deg < 1:
-                    self.horizontal_offset = horizontal_offset_deg * 60
-                    self.horizontal_unit = "\'"
-                else:
-                    self.horizontal_offset = None
-                    self.horizontal_unit = None
-                vertical_coord = SkyCoord(self.start_ra_dec[0] * u.deg, dec * u.deg, frame='icrs')
-                vertical_offset_deg = start_coord.separation(vertical_coord).to(u.deg).value
-                if vertical_offset_deg * 3600 < 60:
-                    self.vertical_offset = vertical_offset_deg * 3600
-                    self.vertical_unit = "\""
-                elif vertical_offset_deg < 1:
-                    self.vertical_offset = vertical_offset_deg * 60
-                    self.vertical_unit = "\'"
-                else:
-                    self.vertical_offset = None
-                    self.vertical_unit = None
-            except Exception: pass
-            self.viewport().update()
-
-
-    def mouseReleaseEvent(self, event):
-        scene_pos = self.mapToScene(event.pos())
-        self.end_point = scene_pos     # needed outside
-        self.end_point_screen = event.pos()
-        
-        # 1. Handle Selection Tool first (Early Exit)
-        if self.rectangle_selection:
-            self.handle_screenshot_release(event)
-            return # Exit early: don't process clicks or middle-button logic
-
-        # 2. Left Button Logic
-        if event.button() == Qt.LeftButton:
-            was_click = (self.end_point_screen - self.start_point_screen).manhattanLength() < 5
-            if was_click:
-                # If we hit an object, we 'return' so we don't refresh the preview unnecessarily
-                if self.handle_object_click(scene_pos):
-                    event.accept()
-                    return
-
-            # If it wasn't a click on an object, update the preview 
-            self.refresh_preview()
-
-        # 3. Middle Button Logic
-        elif event.button() == Qt.MidButton:
-            self.clear_measuring_state()
-            self.setDragMode(QGraphicsView.ScrollHandDrag)
-            self.viewport().update()
-
-        # Final cleanup
-        super().mouseReleaseEvent(event)
-
-
-    def clear_measuring_state(self):
-        self.is_measuring = False
-        self.start_point = None
-        self.start_ra_dec = None
-        self.angular_offset = None
-        self.offset_unit = None
-        self.horizontal_offset = None
-        self.horizontal_unit = None
-        self.vertical_offset = None
-        self.vertical_unit = None
-        
-
-    def handle_screenshot_release(self, _event):
-        """
-        Helper to finalize the rectangle selection process and trigger the save callback.
-        'event' is unused for now
-        """
-        if self.callback_on_selection:
-            # 1. Finalize the rectangle geometry
-            self.selection_rect = QRectF(self.start_point, self.end_point).normalized()
-            
-            # 2. Clean up visual scene items
-            if self.rubber_band:
-                self.scene.removeItem(self.rubber_band)
-                self.rubber_band = None
-            
-            # 3. Restore UI state
-            self.setCursor(Qt.ArrowCursor)
-            
-            # 4. Execute the stored callback (e.g., self.handle_selection_rect)
-            self.callback_on_selection(self.selection_rect)
-            
-            # 5. Reset internal selection variables
-            self.callback_on_selection = None
-            self.start_point = None
-            self.end_point = None
-            self.rectangle_selection = False
-
-            
-    def handle_object_click(self, scene_pos):
-        """
-        Checks if a click at scene_pos hits a MER ellipse or a user-created circle.
-        Returns True if an object was handled, False otherwise. Used in mouseReleaseEvent()
-        """
-        # 1. Check for MER catalog ellipse click
-        if self.catalog_manager and self.catalog_manager.MER_items:
-            for ellipse in self.catalog_manager.MER_items:
-                rect = ellipse.rect()
-                center = rect.center()
-                # Use Euclidean distance check (radius of 10 pixels)
-                distance = ((scene_pos.x() - center.x())**2 + (scene_pos.y() - center.y())**2)**0.5
-            
-                if distance <= 10:
-                    object_id = ellipse.data(0)
-                    if object_id is not None and self.control_dock:
-                        self.control_dock.select_table_row(object_id)
-                        # Highlight selected (Yellow), reset others (Red)
-                        pen = QPen(QColor(255, 255, 0), 1.5) 
-                        ellipse.setPen(pen)
-                        for other in self.catalog_manager.MER_items:
-                            if other != ellipse:
-                                other.setPen(QPen(QColor(255, 0, 0), 1.0))
-                        self.scene.update()
-                        # We return early, and thus QGraphicsView does not receive the releaseEvent signal and thus drags
-                        # the image after the click. Hence we need the next two lines
-                        self.setDragMode(QGraphicsView.NoDrag)
-                        self.setDragMode(QGraphicsView.ScrollHandDrag)
-                        return True # Click handled
-
-        # 2. Check for manual annotation circle click
-        for circle, ra, dec, classifier, normal_thickness in self.circles:
-            circle_rect = circle.rect()
-            circle_center = circle_rect.center()
-            distance = ((scene_pos.x() - circle_center.x())**2 + (scene_pos.y() - circle_center.y())**2)**0.5
-        
-            if distance <= 10:
-                if self.control_dock:
-                    self.control_dock.select_coord_list_item(ra, dec)
-                    # Handle visual thickening of the selected circle
-                    if self.control_dock.selected_circle and self.control_dock.selected_circle != circle:
-                        old_pen = self.control_dock.selected_circle.pen()
-                        old_pen.setWidthF(normal_thickness)
-                        self.control_dock.selected_circle.setPen(old_pen)
-                
-                    new_pen = QPen(circle.pen().color(), normal_thickness * 1.5)
-                    circle.setPen(new_pen)
-                    self.control_dock.selected_circle = circle
-                    self.scene.update()
-                    self.setDragMode(QGraphicsView.NoDrag)
-                    self.setDragMode(QGraphicsView.ScrollHandDrag)
-                return True # Click handled
-
-        return False # No object found at this position
-
-    
-    def mouseDoubleClickEvent(self, event):
-        super().mouseDoubleClickEvent(event)
-        
-    def wheelEvent(self, event):
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-        angle = event.angleDelta().y()
-        factor = 1.2 if angle > 0 else 1 / 1.2
-        self.scale_factor *= factor
-        self.scale(factor, factor)
         if self.control_dock:
             self.control_dock.update_preview(self.last_pixmap)
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-        event.accept()
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Delete and self.control_dock:
-            ra = None
-            dec = None
-            # Priority 1: Use thickened circle (selected_circle) if it exists
-            if self.control_dock.selected_circle:
-                for circle, circle_ra, circle_dec, classifier, normal_thickness in self.circles:
-                    if circle == self.control_dock.selected_circle:
-                        ra, dec = circle_ra, circle_dec
-                        break
-            # Priority 2: Fall back to coord_list selection
-            if ra is None or dec is None:
-                ra, dec = self.control_dock.get_selected_coord()
-            # Delete the matching circle
-            if ra is not None and dec is not None:
-                for circle, circle_ra, circle_dec, classifier, normal_thickness in self.circles[:]:
-                    if abs(circle_ra - ra) < 1e-5 and abs(circle_dec - dec) < 1e-5:
-                        self.scene.removeItem(circle)
-                        self.circles.remove((circle, circle_ra, circle_dec, classifier, normal_thickness))
-                        if self.control_dock.selected_circle == circle:
-                            self.control_dock.selected_circle = None
-                        self.control_dock.update_coord_list(self.circles)
-                        self.viewport().update()
-                        break
-        super().keyPressEvent(event)
+    # ------------------------------------------------------------------
+    # Zoom and viewport navigation
+    # ------------------------------------------------------------------
 
-    # This function is a virtual hook
-    # It is executed automatically by the Qt Event Loop as part of the view's internal
-    # rendering pipeline and is thus not called explicitly anywhere.
-    # The rendering is triggered by calling self.viewport().update()
-    def drawForeground(self, painter, rect):
-        # this draws a ruler when dragging with the middle mouse button
-        super().drawForeground(painter, rect)
-        if self.is_measuring and self.start_point and self.current_point:
-            painter.setRenderHint(QPainter.Antialiasing)
-            solid_pen = QPen(QColor(255, 255, 0), 1, Qt.SolidLine)
-            solid_pen.setCosmetic(True)
-            painter.setPen(solid_pen)
-            painter.drawLine(self.start_point, self.current_point)
-            dashed_pen = QPen(QColor(255, 255, 0), 1, Qt.DashLine)
-            dashed_pen.setCosmetic(True)
-            painter.setPen(dashed_pen)
-            painter.drawLine(self.start_point, QPointF(self.current_point.x(), self.start_point.y()))
-            painter.drawLine(QPointF(self.current_point.x(), self.start_point.y()), self.current_point)
-            painter.setWorldMatrixEnabled(False)
-            font = QFont("Arial", 10)
-            pen = QPen(QColor(255, 255, 0), 1)
-            painter.setFont(font)
-            painter.setPen(pen)
-            if self.angular_offset is not None and self.offset_unit:
-                mid_x = (self.start_point.x() + self.current_point.x()) / 2
-                mid_y = (self.start_point.y() + self.current_point.y()) / 2
-                mid_scene = QPointF(mid_x, mid_y)
-                mid_viewport = self.mapFromScene(mid_scene)
-                label_pos = QPointF(mid_viewport.x(), mid_viewport.y() - 10)
-                text = f"{self.angular_offset:.2f} {self.offset_unit}"
-                painter.drawText(label_pos, text)
-            if self.horizontal_offset is not None and self.horizontal_unit:
-                hor_x = (self.start_point.x() + self.current_point.x()) / 2
-                hor_y = self.start_point.y()
-                hor_scene = QPointF(hor_x, hor_y)
-                hor_viewport = self.mapFromScene(hor_scene)
-                label_pos = QPointF(hor_viewport.x(), hor_viewport.y() + 20)
-                text = f"{self.horizontal_offset:.2f} {self.horizontal_unit}"
-                painter.drawText(label_pos, text)
-            if self.vertical_offset is not None and self.vertical_unit:
-                ver_x = self.current_point.x()
-                ver_y = (self.start_point.y() + self.current_point.y()) / 2
-                ver_scene = QPointF(ver_x, ver_y)
-                ver_viewport = self.mapFromScene(ver_scene)
-                label_pos = QPointF(ver_viewport.x() + 10, ver_viewport.y())
-                text = f"{self.vertical_offset:.2f} {self.vertical_unit}"
-                painter.drawText(label_pos, text)
-            painter.setWorldMatrixEnabled(True)
-
-
-    ######################################################
-    # Zoom functions
-    ######################################################
     def zoom_in(self):
         self.scale_factor *= 1.2
         self.setTransformationAnchor(QGraphicsView.AnchorViewCenter)
         self.scale(1.2, 1.2)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-        if self.control_dock:
-            self.control_dock.update_preview(self.last_pixmap)
+        self.refresh_preview()
 
     def zoom_out(self):
         self.scale_factor /= 1.2
         self.setTransformationAnchor(QGraphicsView.AnchorViewCenter)
-        self.scale(1/1.2, 1/1.2)
+        self.scale(1 / 1.2, 1 / 1.2)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-        if self.control_dock:
-            self.control_dock.update_preview(self.last_pixmap)
+        self.refresh_preview()
 
     def reset_zoom(self):
+        """Return to 1:1 pixel mapping."""
         if self.scale_factor != 1.0:
-            inverse_scale = 1.0 / self.scale_factor
-            self.scale(inverse_scale, inverse_scale)
+            self.scale(1.0 / self.scale_factor, 1.0 / self.scale_factor)
             self.scale_factor = 1.0
-            if self.control_dock:
-                self.control_dock.update_preview(self.last_pixmap)
+            self.refresh_preview()
 
     def reset_transform(self):
+        """Hard-reset the view transform (loses scale_factor tracking)."""
         self.resetTransform()
         self.scale_factor = 1.0
 
     def fit_to_view(self):
+        """Scale and centre the image so the whole tile fits the viewport."""
         if self.last_pixmap and self.image_item:
             self.reset_zoom()
-            view_rect = self.viewport().rect()
+            view_rect  = self.viewport().rect()
             scene_rect = self.sceneRect()
-            scale_x = view_rect.width() / scene_rect.width()
-            scale_y = view_rect.height() / scene_rect.height()
-            scale = min(scale_x, scale_y)
+            scale = min(view_rect.width()  / scene_rect.width(),
+                        view_rect.height() / scene_rect.height())
             self.scale_factor = scale
             self.scale(scale, scale)
             self.centerOn(scene_rect.center())
-            if self.control_dock:
-                self.control_dock.update_preview(self.last_pixmap)
+            self.refresh_preview()
 
     def refresh_preview(self):
+        """Ask the dock to redraw the navigator thumbnail."""
         if self.control_dock and self.last_pixmap:
             self.control_dock.update_preview(self.last_pixmap)
 
-    def get_current_view_center(self):
-        """Gets the current center point of the visible scene."""
-        viewport_center = self.viewport().rect().center()
-        scene_center = self.mapToScene(viewport_center)
-        return scene_center
+    def get_current_view_center(self) -> QPointF:
+        """Return the scene point currently at the physical viewport centre."""
+        return self.mapToScene(self.viewport().rect().center())
 
-    def restore_view_center(self, scene_center):
-        """Centers the view on the given scene point."""
+    def restore_view_center(self, scene_center: QPointF):
+        """Centre the view on *scene_center*."""
         self.centerOn(scene_center)
 
-    def image_saver(self, targetImage, filename):
-        if not os.path.exists(filename):
-            if targetImage.save(filename, "png"):
-                self.update_status(f"Image saved as: {filename}")
-                return True
-            else:
-                QMessageBox.critical(None, "Error", f"Failed to save image to: {filename}")
-                return False
-        else:
-            options = QFileDialog.Options()
-            filename, _ = QFileDialog.getSaveFileName(None, "File Already Exists - Choose New Name",
-                                                        filename,
-                                                        "PNG Files (*.png);;All Files (*)",
-                                                        options=options)
-            if filename:
-                if targetImage.save(filename, "png"):
-                    self.update_status(f"Image saved as: {filename}")
-                    return True
-                else:
-                    QMessageBox.critical(None, "Error", f"Failed to save image to: {filename}")
-                    return False
-            else:
-                print("Saving cancelled by user.")
-                return False
-        
+    # ------------------------------------------------------------------
+    # Export / screenshot — thin wrappers around ImageExporter
+    # ------------------------------------------------------------------
+
+    def start_selection(self):
+        """Enter rubber-band screenshot mode (delegates to ImageExporter)."""
+        self.exporter.start_selection()
+
     def save_full_image_with_overlays(self):
-        """Saves the entire image with all current overlays at full resolution."""
-        if self.original_image is None:
-            return
-
-        # 1. Disable buttons to prevent race conditions (if the user erroneously double-clicked)
-        if self.control_dock:
-            self.control_dock.photoPushButton.setEnabled(False)
-
-        try:
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            
-            # Store current view to restore later
-            current_rect = self.sceneRect()
-            
-            # 2. Setup rendering logic: Expand scene to full image size
-            self.fit_to_view()
-            
-            # Define output path (Euclid naming convention)
-            filename = f"{self.dirpath}/{self.tileID}_{cen_ra:.6f}_{cen_dec:.5f}.png"
-            
-            # 3. Execution Logic: Create the high-resolution buffer
-            # We use QImage.Format_ARGB32_Premultiplied for best performance with overlays
-            size = self.scene.itemsBoundingRect().size().toSize()
-            image_buffer = QImage(size, QImage.Format_ARGB32_Premultiplied)
-            image_buffer.fill(Qt.black)
-
-            # Paint the scene (Image + MER Overlays) into the buffer
-            painter = QPainter(image_buffer)
-            painter.setRenderHint(QPainter.Antialiasing)
-            self.scene.render(painter)
-            painter.end()
-
-            # 4. Save Logic: Use the existing image_saver helper
-            # This ensures consistent metadata handling
-            self.image_saver(image_buffer, filename)
-            
-            # Restore the user's zoom level
-            # self.setSceneRect(current_rect)
-            # self.fit_to_view()
-            self.fitInView(current_rect)
-             
-            if self.main_window:
-                self.main_window.statusBar().showMessage(f"Saved full resolution image to {filename}", 5000)
-
-        except Exception as e:
-            print(f"Error during full resolution save: {e}")
-            if self.main_window:
-                self.main_window.statusBar().showMessage("Error saving full resolution image", 5000)
-
-        finally:
-            # 5. Re-enable buttons and restore cursor
-            if self.control_dock:
-                self.control_dock.SmallPushButton.setEnabled(True)
-            QApplication.restoreOverrideCursor()
-
+        self.exporter.save_full_image_with_overlays()
 
     def save_visible_area_with_overlays(self):
-        """Saves only the currently visible area of the image and overlays."""
-        if self.original_image is None:
-            return
-        if not self.qimage:
-            return
-
-        # 1. Disable buttons to prevent race conditions during the capture
-        if self.control_dock:
-            self.control_dock.SmallPushButton.setEnabled(False)
-
-        try:
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-
-            # 2. Determine the visible region in scene coordinates
-            # viewport().rect() is the size of the window widget
-            # mapToScene() converts that window box into the image's coordinate system
-            visible_scene_rect = self.mapToScene(self.viewport().rect()).boundingRect()
-            
-            # Ensure the rectangle is within the image bounds to avoid black borders
-            visible_scene_rect = visible_scene_rect.intersected(self.sceneRect())
-
-            # 3. Create a buffer matching the size of the visible pixels
-            # We use the integer size of the viewport for a 1:1 screen-to-file match
-            output_size = self.viewport().size()
-            image_buffer = QImage(output_size, QImage.Format_ARGB32_Premultiplied)
-            image_buffer.fill(Qt.black)
-
-            # 4. Render only the visible portion
-            painter = QPainter(image_buffer)
-            painter.setRenderHint(QPainter.Antialiasing)
-            
-            # This specific render call maps the scene's visible rect 
-            # exactly onto the image_buffer's rect
-            self.scene.render(painter, QRectF(image_buffer.rect()), visible_scene_rect)
-            painter.end()
-
-            # 5. Define filename and save
-            rect_x = visible_scene_rect.center().x()
-            rect_y = visible_scene_rect.center().y()
-            rect_y = self.original_image.shape[0] - rect_y
-            cen_ra, cen_dec = self.wcs.pixel_to_world(rect_x, rect_y)
-
-            filename = f"{self.dirpath}/{self.tileID}_{cen_ra:.6f}_{cen_dec:.5f}.png"       
-            self.image_saver(image_buffer, filename)
-            
-            if self.main_window:
-                self.main_window.statusBar().showMessage(f"Saved visible area to {filename}", 5000)
-
-        except Exception as e:
-            print(f"Error during visible area save: {e}")
-            if self.main_window:
-                self.main_window.statusBar().showMessage("Error saving visible area", 5000)
-
-        finally:
-            # 6. Re-enable buttons and restore cursor
-            if self.control_dock:
-                self.control_dock.photoPushButton.setEnabled(True)
-            QApplication.restoreOverrideCursor()
+        self.exporter.save_visible_area_with_overlays()
 
     def save_area_from_selection(self, rect: QRectF):
+        self.exporter.save_area_from_selection(rect)
+
+    # ------------------------------------------------------------------
+    # Crosshair helper (rubber-band mode)
+    # ------------------------------------------------------------------
+
+    def create_crosshair(self, parent_item) -> QGraphicsItemGroup:
         """
-        Saves the area defined by the selection rectangle
-        including all overlays, as a PNG file at the native resolution (zoom level 1.0).
+        Build a small red crosshair QGraphicsItemGroup parented to parent_item.
+        Repositioned in mouseMoveEvent while rubber-band selection is active.
         """
-        if self.original_image is None:
+        length = 5.0
+        pen    = QPen(QColor("red"), 1, Qt.SolidLine)
+        v_line = QGraphicsLineItem(0, -length, 0, length)
+        h_line = QGraphicsLineItem(-length, 0, length, 0)
+        v_line.setPen(pen)
+        h_line.setPen(pen)
+        group = QGraphicsItemGroup(parent_item)
+        group.addToGroup(v_line)
+        group.addToGroup(h_line)
+        group.setPos(0, 0)
+        return group
+
+    # ------------------------------------------------------------------
+    # Measurement state
+    # ------------------------------------------------------------------
+
+    def clear_measuring_state(self):
+        """Reset all distance-measurement variables (called on middle-button release)."""
+        self.is_measuring       = False
+        self.start_point        = None
+        self.start_ra_dec       = None
+        self.angular_offset     = None
+        self.offset_unit        = None
+        self.horizontal_offset  = None
+        self.horizontal_unit    = None
+        self.vertical_offset    = None
+        self.vertical_unit      = None
+
+    # ------------------------------------------------------------------
+    # Qt event handlers
+    # ------------------------------------------------------------------
+
+    def mousePressEvent(self, event):
+        scene_pos = self.mapToScene(event.pos())
+        self.start_point = scene_pos
+
+        # Cache WCS coordinates at press for the ruler and annotation placement
+        if self.wcs and self.original_image is not None:
+            fy = self.original_image.shape[0] - scene_pos.y()
+            self.start_ra_dec = self.wcs.pixel_to_world(scene_pos.x(), fy)
+
+        # Record screen-space press position for the click-vs-drag test in
+        # mouseReleaseEvent.  Done before the rubber-band early-return so the
+        # value is always fresh for the matching release.
+        if event.button() == Qt.LeftButton:
+            self.start_point_screen = event.pos()
+
+        # Rubber-band / screenshot mode
+        if self.rectangle_selection:
+            if event.button() == Qt.LeftButton:
+                self.rubber_band = QGraphicsRectItem(QRectF(self.start_point, QPointF()))
+                pen = QPen(QColor("white"), 1, Qt.DashLine)
+                self.rubber_band.setPen(pen)
+                self.scene.addItem(self.rubber_band)
+                self.crosshair = self.create_crosshair(self.rubber_band)
+            return   # Don't call super(); that would activate scroll drag
+
+        elif event.button() == Qt.MidButton:
+            self.is_measuring = True
+            self.setDragMode(QGraphicsView.NoDrag)
+            self.viewport().update()
             return
-        if not self.qimage:
-            print("No image loaded.")
-            return
 
-        # Create the high-quality buffer for the cutout
-        image_buffer = QImage(rect.size().toSize(), QImage.Format_ARGB32_Premultiplied)
-        image_buffer.fill(Qt.black)
+        elif event.button() == Qt.RightButton:
+            import sip
+            # Remove an existing circle if the click is close enough to one
+            for ann in self.annotations[:]:
+                if sip.isdeleted(ann.item):
+                    self.annotations.remove(ann)
+                    continue
+                centre = ann.item.rect().center()
+                dist   = ((scene_pos.x() - centre.x()) ** 2 +
+                          (scene_pos.y() - centre.y()) ** 2) ** 0.5
+                if dist <= 10:
+                    self.scene.removeItem(ann.item)
+                    self.annotations.remove(ann)
+                    if self.control_dock:
+                        self.control_dock.update_coord_list(self.annotations)
+                        if self.control_dock.selected_circle == ann.item:
+                            self.control_dock.selected_circle = None
+                    self.viewport().update()
+                    return
+            # No circle hit — show the classification context menu
+            self._show_annotation_menu(event, scene_pos)
 
-        painter = QPainter(image_buffer)
-        painter.setRenderHint(QPainter.Antialiasing)
-        # Render the specific part of the scene defined by 'rect'
-        self.scene.render(painter, QRectF(image_buffer.rect()), rect)
-        painter.end()
+        super().mousePressEvent(event)
 
-        filename = f"{self.dirpath}/{self.tileID}_{self.crosshair_ra:.6f}_{self.crosshair_dec:.5f}.png"       
-        self.image_saver(image_buffer, filename)
+    def _show_annotation_menu(self, event, scene_pos: QPointF):
+        """Build and execute the right-click annotation classification menu."""
+        menu = QMenu(self)
 
-        
-    def handle_selection_rect(self, rect: QRectF):
-        """Internal callback: Handles the selected rectangle and saves the area."""
-        # Prevent double-processing if buttons are already disabled
-        if self.control_dock and not self.control_dock.photoPushButton.isEnabled():
-            return
+        categories = {
+            "GL":  ["lens", "arc", "multiple image", "Einstein ring", "DSPL"],
+            "AGN": ["Seyfert 1", "outflow"],
+            "Gx":  ["Emissionline", "Ring", "Polar ring", "Stream",
+                    "Merger", "Irregular", "Dwarf", "weird"],
+        }
+        color_map = {
+            "GL":  QColor(0, 200, 255),
+            "AGN": QColor(220, 220, 0),
+            "Gx":  QColor(255, 50, 50),
+        }
 
-        # 1. Disable buttons at the start
-        if self.control_dock:
-            self.control_dock.photoPushButton.setEnabled(False)
+        action_to_label: dict = {}
+        for cat, entries in categories.items():
+            for label in entries:
+                full_label = f"{cat}: {label}"
+                action_to_label[menu.addAction(full_label)] = full_label
+            menu.addSeparator()
 
-        try:
-            self.setCursor(Qt.CrossCursor)
-            self.save_area_from_selection(rect)
-        finally:
-            # 2. Re-enable buttons and cleanup state no matter what happens
-            self.rectangle_selection = False
+        chosen = menu.exec_(self.mapToGlobal(event.pos()))
+        if chosen and self.wcs and self.original_image is not None and self.start_ra_dec:
+            classifier = action_to_label[chosen]
+            cat_prefix = classifier.split(":")[0]
+            color      = color_map.get(cat_prefix, QColor(255, 255, 255))
+            thickness  = 2.0
+
+            item = QGraphicsEllipseItem(scene_pos.x() - 10, scene_pos.y() - 10, 20, 20)
+            item.setPen(QPen(color, thickness))
+            item.setZValue(10)
+            self.scene.addItem(item)
+
+            self.annotations.append(Annotation(
+                item=item,
+                ra=self.start_ra_dec[0],
+                dec=self.start_ra_dec[1],
+                classifier=classifier,
+                normal_thickness=thickness,
+            ))
             if self.control_dock:
-                self.control_dock.photoPushButton.setEnabled(True)
-            
-            QApplication.restoreOverrideCursor()
-            QApplication.setOverrideCursor(Qt.ArrowCursor)
+                self.control_dock.update_coord_list(self.annotations)
+            self.viewport().update()
 
-    def set_image(self, qimage: QImage):
-        self.qimage = qimage
-        if qimage:
-            pixmap = QPixmap.fromImage(qimage)
-            self.scene.clear()
-            self.scene.addPixmap(pixmap)
-            self.setSceneRect(self.scene.itemsBoundingRect())
-            self.reset_selection()
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
 
-    def add_graphics_item(self, item):
-        self.scene.addItem(item)
+        if not self.wcs or not self.control_dock or self.original_image is None:
+            return
 
-    def reset_selection(self):
-        if self.rubber_band:
-            self.scene.removeItem(self.rubber_band)
-            self.rubber_band = None
-        self.start_point = None
-        self.current_point = None
-        self.selection_rect = None
-        self.setCursor(Qt.ArrowCursor)
-        
-    def start_selection(self):  # Called when the user clicks the photo button
-        self.rectangle_selection = True
-        QApplication.setOverrideCursor(Qt.CrossCursor)
-        self.start_point = None
-        self.current_point = None
-        self.selection_rect = None
-        self.callback_on_selection = self.handle_selection_rect
+        self.current_point = self.mapToScene(event.pos())
+        # FITS images are stored bottom-up; Qt renders top-down — flip y before WCS calls
+        fy = self.original_image.shape[0] - self.current_point.y()
 
+        # Only update the magnifier when the cursor is actually over the image;
+        # outside the image rect the magnifier would show edge pixels, which is
+        # more confusing than showing nothing.
+        if self.sceneRect().contains(self.current_point):
+            self.control_dock.update_magnifier(self.current_point)
+            try:
+                ra, dec = self.wcs.pixel_to_world(self.current_point.x(), fy)
+                self.control_dock.update_cursor_display(self.current_point.x(), fy, ra, dec)
+            except Exception:
+                pass
+        else:
+            self.control_dock.update_cursor_display(None, None, None, None)
+            return
+
+        # Rubber-band and measurement are mutually exclusive modes; the
+        # rubber-band check comes first so it returns before measurement logic.
+        if self.rectangle_selection and self.rubber_band:
+            rect = QRectF(self.start_point, self.current_point).normalized()
+            self.rubber_band.setRect(rect)
+            if self.crosshair and self.crosshair.scene():
+                self.crosshair.setPos(rect.center())
+                ch_x = rect.center().x()
+                ch_y = self.original_image.shape[0] - rect.center().y()
+                self.crosshair_ra, self.crosshair_dec = self.wcs.pixel_to_world(ch_x, ch_y)
+            return
+
+        # Distance measurement ruler update
+        if self.is_measuring and self.start_point and self.start_ra_dec:
+            try:
+                ra, dec = self.wcs.pixel_to_world(self.current_point.x(), fy)
+                self._update_measurement(ra, dec)
+            except Exception:
+                pass
+            self.viewport().update()
+
+    def _update_measurement(self, ra: float, dec: float):
+        """
+        Recompute the ruler labels from the start WCS position to (ra, dec).
+
+        Separations are converted to arcseconds or arcminutes depending on
+        magnitude and stored as (value, unit_string) pairs for drawForeground.
+        """
+        def _to_unit(deg: float):
+            if deg * 3600 < 60:
+                return deg * 3600, '"'
+            elif deg < 1:
+                return deg * 60, "'"
+            return None, None
+
+        s0 = SkyCoord(self.start_ra_dec[0] * u.deg, self.start_ra_dec[1] * u.deg, frame='icrs')
+        s1 = SkyCoord(ra * u.deg,                   dec * u.deg,                   frame='icrs')
+        sh = SkyCoord(ra * u.deg,                   self.start_ra_dec[1] * u.deg, frame='icrs')
+        sv = SkyCoord(self.start_ra_dec[0] * u.deg, dec * u.deg,                  frame='icrs')
+
+        self.angular_offset,    self.offset_unit    = _to_unit(s0.separation(s1).deg)
+        self.horizontal_offset, self.horizontal_unit = _to_unit(s0.separation(sh).deg)
+        self.vertical_offset,   self.vertical_unit   = _to_unit(s0.separation(sv).deg)
+
+    def mouseReleaseEvent(self, event):
+        self.end_point        = self.mapToScene(event.pos())
+        self.end_point_screen = event.pos()
+
+        # Rubber-band completion: only fire on left-button release so that an
+        # accidental right- or middle-click during a rubber-band drag does not
+        # prematurely trigger the screenshot callback.
+        if self.rectangle_selection:
+            if event.button() == Qt.LeftButton:
+                self._handle_screenshot_release()
+            return
+
+        if event.button() == Qt.LeftButton:
+            # Guard: start_point_screen is None if no left-press was recorded
+            # (e.g. the press happened outside the widget).
+            if self.start_point_screen is not None:
+                was_click = (self.end_point_screen - self.start_point_screen).manhattanLength() < 5
+                self.start_point_screen = None   # consumed; reset for next press
+                if was_click:
+                    # Always call super() first so Qt cancels the ScrollHandDrag
+                    # that it armed on press — skipping it leaves the view in a
+                    # dragging state and the image pans on the next mouse move.
+                    super().mouseReleaseEvent(event)
+                    self._handle_object_click(self.end_point)
+                    return
+            self.refresh_preview()
+
+        elif event.button() == Qt.MidButton:
+            self.clear_measuring_state()
+            self.setDragMode(QGraphicsView.ScrollHandDrag)
+            self.viewport().update()
+
+        super().mouseReleaseEvent(event)
+
+    def _handle_screenshot_release(self):
+        """Finalise the rubber-band rectangle and fire callback_on_selection."""
+        if self.callback_on_selection:
+            if self.start_point is None or self.end_point is None:
+                return   # press happened outside the widget — nothing to do
+            self.selection_rect = QRectF(self.start_point, self.end_point).normalized()
+            if self.rubber_band:
+                self.scene.removeItem(self.rubber_band)
+                self.rubber_band = None
+            self.setCursor(Qt.ArrowCursor)
+            cb = self.callback_on_selection
+            # Clear state before calling cb so re-entrant calls are safe
+            self.callback_on_selection = None
+            self.start_point           = None
+            self.end_point             = None
+            self.rectangle_selection   = False
+            cb(self.selection_rect)
+
+    def _handle_object_click(self, scene_pos: QPointF) -> bool:
+        """
+        Test whether a left-click at *scene_pos* hits a MER ellipse or an
+        annotation circle.  Applies highlight styling and returns True if an
+        object was handled (suppresses the default preview refresh).
+        """
+        import sip
+
+        # Hit radius in scene space.  10 screen pixels divided by the current
+        # zoom factor converts to the equivalent scene-space radius so the
+        # click target stays the same physical size regardless of zoom level.
+        hit_radius = 10.0 / max(self.scale_factor, 0.01)
+
+        # MER catalog ellipses — use the scene's BspTree spatial index to get
+        # only the items near the click point instead of scanning all N items.
+        if self.catalog_manager and self.catalog_manager.MER_items:
+            search_rect = QRectF(
+                scene_pos.x() - hit_radius, scene_pos.y() - hit_radius,
+                hit_radius * 2,             hit_radius * 2,
+            )
+            nearby = self.scene.items(search_rect)
+            for ellipse in nearby:
+                if not isinstance(ellipse, QGraphicsEllipseItem):
+                    continue
+                if sip.isdeleted(ellipse):
+                    continue
+                if ellipse not in self.catalog_manager.MER_items:
+                    continue   # could be an annotation or selection-overlay item
+                centre = ellipse.rect().center()
+                dist   = ((scene_pos.x() - centre.x()) ** 2 +
+                          (scene_pos.y() - centre.y()) ** 2) ** 0.5
+                if dist <= hit_radius:
+                    oid = ellipse.data(0)
+                    if oid is not None and self.control_dock:
+                        self.control_dock.select_table_row(oid)
+                        # Reset all visible MER items to red, then highlight hit
+                        for other in self.catalog_manager.MER_items:
+                            if not sip.isdeleted(other) and other.isVisible():
+                                other.setPen(QPen(QColor(255, 0, 0), 1.0))
+                        ellipse.setPen(QPen(QColor(255, 255, 0), 1.5))
+                        self.scene.update()
+                    return True
+
+        # User annotation circles
+        for ann in self.annotations:
+            if sip.isdeleted(ann.item):
+                continue
+            centre = ann.item.rect().center()
+            dist   = ((scene_pos.x() - centre.x()) ** 2 +
+                      (scene_pos.y() - centre.y()) ** 2) ** 0.5
+            if dist <= hit_radius:
+                if self.control_dock:
+                    self.control_dock.select_coord_list_item(ann.ra, ann.dec)
+                    # Reset the previously selected circle
+                    if (self.control_dock.selected_circle and
+                            not sip.isdeleted(self.control_dock.selected_circle) and
+                            self.control_dock.selected_circle != ann.item):
+                        for a in self.annotations:
+                            if a.item == self.control_dock.selected_circle:
+                                pen = a.item.pen()
+                                pen.setWidthF(a.normal_thickness)
+                                a.item.setPen(pen)
+                                break
+                    # Thicken the newly selected circle
+                    new_pen = QPen(ann.item.pen().color(), ann.normal_thickness * 1.5)
+                    ann.item.setPen(new_pen)
+                    self.control_dock.selected_circle = ann.item
+                    self.scene.update()
+                return True
+
+        return False
+
+    def keyPressEvent(self, event):
+        """Delete key removes the currently selected annotation circle."""
+        if event.key() == Qt.Key_Delete and self.control_dock:
+            import sip
+            target_ann = None
+
+            # Priority 1: delete by item identity — the visually thickened
+            # (selected_circle) item.  Identity is exact and unambiguous even
+            # when two annotations share the same sky position.
+            if (self.control_dock.selected_circle and
+                    not sip.isdeleted(self.control_dock.selected_circle)):
+                for ann in self.annotations:
+                    if ann.item is self.control_dock.selected_circle:
+                        target_ann = ann
+                        break
+
+            # Priority 2: coord_list keyboard selection — fall back to
+            # RA/Dec proximity only when no item is highlighted.
+            if target_ann is None:
+                ra, dec = self.control_dock.get_selected_coord()
+                if ra is not None and dec is not None:
+                    for ann in self.annotations:
+                        if abs(ann.ra - ra) < 1e-5 and abs(ann.dec - dec) < 1e-5:
+                            target_ann = ann
+                            break
+
+            if target_ann is not None:
+                if not sip.isdeleted(target_ann.item):
+                    self.scene.removeItem(target_ann.item)
+                if self.control_dock.selected_circle is target_ann.item:
+                    self.control_dock.selected_circle = None
+                self.annotations.remove(target_ann)
+                self.control_dock.update_coord_list(self.annotations)
+                self.viewport().update()
+
+        super().keyPressEvent(event)
+
+    def wheelEvent(self, event):
+        """Scroll wheel zooms, anchored to the cursor position."""
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
+        self.scale_factor *= factor
+        self.scale(factor, factor)
+        self.refresh_preview()
+        event.accept()
+
+    # ------------------------------------------------------------------
+    # drawForeground — measurement ruler (Qt virtual hook)
+    # ------------------------------------------------------------------
+
+    def drawForeground(self, painter: QPainter, rect):
+        """
+        Qt virtual hook called automatically each time the viewport is redrawn.
+        Draws the distance-measurement ruler overlay when the middle mouse
+        button is held down.
+
+        The ruler consists of:
+          - A solid diagonal line from start to current cursor position
+          - Dashed horizontal and vertical legs forming a right triangle
+          - Text labels for the total, horizontal, and vertical separations
+        """
+        super().drawForeground(painter, rect)
+
+        if not (self.is_measuring and self.start_point and self.current_point):
+            return
+
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Diagonal line
+        solid = QPen(QColor(255, 255, 0), 1, Qt.SolidLine)
+        solid.setCosmetic(True)
+        painter.setPen(solid)
+        painter.drawLine(self.start_point, self.current_point)
+
+        # Right-triangle legs
+        dashed = QPen(QColor(255, 255, 0), 1, Qt.DashLine)
+        dashed.setCosmetic(True)
+        painter.setPen(dashed)
+        corner = QPointF(self.current_point.x(), self.start_point.y())
+        painter.drawLine(self.start_point, corner)
+        painter.drawLine(corner, self.current_point)
+
+        # Text labels — drawn in viewport (screen) coordinates.
+        # All mapFromScene() calls must happen BEFORE setWorldMatrixEnabled(False)
+        # because mapFromScene() uses the current view transform.  Calling it
+        # after disabling the world matrix would give wrong positions if the
+        # painter has a non-identity render offset.
+        mid_scene = QPointF((self.start_point.x() + self.current_point.x()) / 2,
+                             (self.start_point.y() + self.current_point.y()) / 2)
+        hor_scene = QPointF(mid_scene.x(), self.start_point.y())
+        ver_scene = QPointF(self.current_point.x(), mid_scene.y())
+
+        mid_vp = self.mapFromScene(mid_scene)
+        hor_vp = self.mapFromScene(hor_scene)
+        ver_vp = self.mapFromScene(ver_scene)
+
+        painter.setWorldMatrixEnabled(False)
+        painter.setFont(QFont("Arial", 10))
+        painter.setPen(QPen(QColor(255, 255, 0), 1))
+
+        if self.angular_offset is not None:
+            painter.drawText(QPointF(mid_vp.x(),       mid_vp.y() - 10),
+                             f"{self.angular_offset:.2f} {self.offset_unit}")
+        if self.horizontal_offset is not None:
+            painter.drawText(QPointF(hor_vp.x(),       hor_vp.y() + 20),
+                             f"{self.horizontal_offset:.2f} {self.horizontal_unit}")
+        if self.vertical_offset is not None:
+            painter.drawText(QPointF(ver_vp.x() + 10,  ver_vp.y()),
+                             f"{self.vertical_offset:.2f} {self.vertical_unit}")
+
+        painter.setWorldMatrixEnabled(True)
