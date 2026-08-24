@@ -124,8 +124,13 @@ class ImageExporter:
 
         The FITS y-axis runs bottom-to-top, Qt's top-to-bottom, so the flip is
         applied here before calling pixel_to_world.
+
+        Falls back to a pixel-coordinate-based filename when no valid WCS
+        is available (v.wcs is None) — see ImageViewer.on_image_loaded.
         """
         v = self._v
+        if v.wcs is None:
+            return os.path.join(v.dirpath, f"{v.tileID}_x{scene_x:.0f}_y{scene_y:.0f}.png")
         flipped_y = v.original_image.shape[0] - scene_y
         ra, dec    = v.wcs.pixel_to_world(scene_x, flipped_y)
         return os.path.join(v.dirpath, f"{v.tileID}_{ra:.6f}_{dec:.5f}.png")
@@ -258,10 +263,20 @@ class ImageExporter:
         v.scene.render(painter, QRectF(buffer.rect()), rect)
         painter.end()
 
-        filename = os.path.join(
-            v.dirpath,
-            f"{v.tileID}_{v.crosshair_ra:.6f}_{v.crosshair_dec:.5f}.png"
-        )
+        # Falls back to a pixel-coordinate filename when no valid WCS is
+        # available — crosshair_ra/dec would otherwise be stale (last
+        # valid-WCS value, or the 0.0 init default) rather than reflecting
+        # "no WCS", which would silently produce a misleading filename.
+        if v.wcs is None:
+            centre = rect.center()
+            filename = os.path.join(
+                v.dirpath, f"{v.tileID}_x{centre.x():.0f}_y{centre.y():.0f}.png"
+            )
+        else:
+            filename = os.path.join(
+                v.dirpath,
+                f"{v.tileID}_{v.crosshair_ra:.6f}_{v.crosshair_dec:.5f}.png"
+            )
         self._save_image(buffer, filename)
 
     # ------------------------------------------------------------------

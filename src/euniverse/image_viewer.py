@@ -55,6 +55,7 @@ What is NOT here
 import os
 import re
 import gc
+import logging
 
 import numpy as np
 from PIL import Image
@@ -76,7 +77,9 @@ from .annotations     import Annotation
 from .catalog_manager import CatalogManager
 from .image_exporter  import ImageExporter
 from .workers         import TiffLoader
-from .wcs_utils       import WCSConverter
+from .wcs_utils       import WCSConverter, InvalidWCSError
+
+logger = logging.getLogger(__name__)
 
 # Astropy sometimes does not recognise the 'NA' unit used in Euclid FITS files.
 # Define it once at import time so every module that reads those files benefits.
@@ -320,9 +323,31 @@ class ImageViewer(QGraphicsView):
             self.update_status("Processing TIFF …")
             self.original_image = image
             self.metadata       = metadata
-            self.wcs            = WCSConverter(metadata)
-            if self.wcs is None:
-                raise ValueError("WCSConverter returned None")
+
+            try:
+                self.wcs = WCSConverter(metadata)
+                if self.control_dock:
+                    self.control_dock.set_wcs_available(True)
+            except InvalidWCSError as we:
+                # Not a load failure: the pixel data is fine, only the
+                # astrometric solution is missing/broken. Continue
+                # displaying the image with self.wcs = None; every WCS
+                # consumer elsewhere already guards on that (catalog
+                # overlay, ruler, cursor readout), so this disables all
+                # of them consistently rather than letting them run on
+                # a silently-wrong transform.
+                self.wcs = None
+                logger.warning(f"Invalid WCS in {path}: {we}")
+                QMessageBox.warning(
+                    self, "Invalid WCS",
+                    "This image's WCS could not be validated and has been "
+                    f"disabled:\n\n{we}\n\n"
+                    "The image will still display, but sky-coordinate "
+                    "features (cursor RA/Dec, catalog overlay, distance "
+                    "measurement, WCS-based exports) are unavailable."
+                )
+                if self.control_dock:
+                    self.control_dock.set_wcs_available(False)
 
             h, w = image.shape[:2]
 
@@ -1024,7 +1049,7 @@ class ImageViewer(QGraphicsView):
     def mouseMoveEvent(self, event):
         super().mouseMoveEvent(event)
 
-        if not self.wcs or not self.control_dock or self.original_image is None:
+        if not self.control_dock or self.original_image is None:
             return
 
         self.current_point = self.mapToScene(event.pos())
@@ -1036,11 +1061,17 @@ class ImageViewer(QGraphicsView):
         # more confusing than showing nothing.
         if self.sceneRect().contains(self.current_point):
             self.control_dock.update_magnifier(self.current_point)
-            try:
-                ra, dec = self.wcs.pixel_to_world(self.current_point.x(), fy)
-                self.control_dock.update_cursor_display(self.current_point.x(), fy, ra, dec)
-            except Exception:
-                pass
+            # Pixel (x, y) readout does not depend on WCS and should keep
+            # working even when self.wcs is None (missing/invalid WCS);
+            # RA/Dec is only attempted — and only passed on — if a WCS
+            # is actually available.
+            ra, dec = None, None
+            if self.wcs:
+                try:
+                    ra, dec = self.wcs.pixel_to_world(self.current_point.x(), fy)
+                except Exception:
+                    ra, dec = None, None
+            self.control_dock.update_cursor_display(self.current_point.x(), fy, ra, dec)
         else:
             self.control_dock.update_cursor_display(None, None, None, None)
             return
@@ -1052,9 +1083,13 @@ class ImageViewer(QGraphicsView):
             self.rubber_band.setRect(rect)
             if self.crosshair and self.crosshair.scene():
                 self.crosshair.setPos(rect.center())
-                ch_x = rect.center().x()
-                ch_y = self.original_image.shape[0] - rect.center().y()
-                self.crosshair_ra, self.crosshair_dec = self.wcs.pixel_to_world(ch_x, ch_y)
+                if self.wcs:
+                    ch_x = rect.center().x()
+                    ch_y = self.original_image.shape[0] - rect.center().y()
+                    try:
+                        self.crosshair_ra, self.crosshair_dec = self.wcs.pixel_to_world(ch_x, ch_y)
+                    except Exception:
+                        pass
             return
 
         # Distance measurement ruler update

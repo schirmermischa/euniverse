@@ -26,6 +26,7 @@
 # SOFTWARE.
 
 import sys
+import os
 import logging
 import argparse
 from pathlib import Path
@@ -42,7 +43,7 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, initial_file=None):
         super().__init__()
         self.setWindowTitle("Euniverse Explorer")
         
@@ -56,6 +57,24 @@ class MainWindow(QMainWindow):
             self.critical_error(f"UI Initialization failed: {e}")
             
         self.resize(1280, 1080)
+
+        if initial_file:
+            self._load_initial_file(initial_file)
+
+    def _load_initial_file(self, path):
+        """
+        Load a TIFF given on the command line, bypassing the file dialog.
+        Mirrors what ImageViewer.open_file_dialog does once a path is chosen.
+        """
+        path = os.path.abspath(path)
+        if not os.path.isfile(path):
+            logger.error(f"File not found: {path}")
+            QMessageBox.critical(self, "File Not Found", f"No such file:\n{path}")
+            return
+
+        self.viewer.filepath = path
+        self.viewer.dirpath  = os.path.dirname(path)
+        self.viewer.load_image(path)
 
     def init_ui(self):
         """Builds the main layout and connects components."""
@@ -104,6 +123,8 @@ def main():
     parser = argparse.ArgumentParser(description="euniverse: Euclid data analysis")
     parser.add_argument('-v', '--version', action='version', version=f'%(prog)s {current_version}')
     parser.add_argument('--debug', action='store_true', help="Enable verbose logging")
+    parser.add_argument('file', nargs='?', default=None,
+                         help="MER tile TIFF file to load on startup")
     args = parser.parse_args()
 
     if args.debug:
@@ -114,7 +135,7 @@ def main():
     app.setStyle("Fusion")
     
     try:
-        window = MainWindow()
+        window = MainWindow(initial_file=args.file)
         window.show()
         sys.exit(app.exec_())
     except Exception as e:

@@ -94,6 +94,7 @@ class ControlDock(QWidget):
         self.table_dialog = None
         self.plot_dialog = None
         self.is_viewer_displaying_preview = False
+        self.wcs_available = True
         self.init_ui()
 
     def init_ui(self):
@@ -113,6 +114,19 @@ class ControlDock(QWidget):
             self.layout.addWidget(QLabel("Error: control_dock.ui missing."))
             return
         uic.loadUi(ui_file, self)
+
+        # Designer's scaledContents=True on these two labels stretches
+        # whatever pixmap is assigned to fill the full 240x240 label
+        # regardless of the pixmap's own aspect ratio — that silently
+        # undoes the Qt.KeepAspectRatio scaling done in update_preview()
+        # and update_magnifier() below, and is what causes visible
+        # distortion for non-square (e.g. very wide/tall tile) images.
+        # Alignment is left at Designer's default (top-left) rather than
+        # centred, since preview_mouse_move()/handle_preview_drag() map
+        # click positions assuming the pixmap is drawn at the label's
+        # origin with no centering offset.
+        self.preview_label.setScaledContents(False)
+        self.magnifier_label.setScaledContents(False)
 
         # Configure sliders
         self.min_slider.setMinimum(0)
@@ -367,11 +381,41 @@ class ControlDock(QWidget):
 
         self.cartesianxLabel.setText(f"x = {x:.1f}")
         self.cartesianyLabel.setText(f"y = {y:.1f}")
+
+        # ra/dec are None when no valid WCS is available for the loaded
+        # image (see set_wcs_available). Pixel coordinates above are still
+        # meaningful and get updated regardless; the equatorial labels are
+        # left as-is (set_wcs_available already blanked/disabled them).
+        if ra is None or dec is None:
+            return
+
         self.equatorialRALabel.setText(f"α = {ra:.6f}")
         self.equatorialDecLabel.setText(f"δ = {dec:.6f}")
         ra_str, dec_str = self.degrees_to_sexagesimal(ra, dec)
         self.equatorialRAHexLabel.setText(f"α = {ra_str}")
         self.equatorialDecHexLabel.setText(f"δ = {dec_str}")
+
+    def set_wcs_available(self, available: bool):
+        """
+        Enable or disable the sky-coordinate (RA/Dec) readout labels.
+
+        Called by ImageViewer.on_image_loaded once a WCS has been
+        validated (available=True) or found to be missing/invalid
+        (available=False). Pixel (x, y) coordinates are unaffected —
+        they don't depend on the WCS and keep updating either way.
+        """
+        self.wcs_available = available
+        labels = (
+            self.equatorialRALabel, self.equatorialDecLabel,
+            self.equatorialRAHexLabel, self.equatorialDecHexLabel,
+        )
+        for label in labels:
+            label.setEnabled(available)
+        if not available:
+            self.equatorialRALabel.setText("α = —")
+            self.equatorialDecLabel.setText("δ = —")
+            self.equatorialRAHexLabel.setText("α = —")
+            self.equatorialDecHexLabel.setText("δ = —")
 
     def update_coord_list(self, entries):
         """
