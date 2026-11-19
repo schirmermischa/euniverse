@@ -49,7 +49,7 @@ Design notes
 
 from PyQt5.QtWidgets import (
     QApplication, QLabel, QListWidget, QSlider, QWidget, QPushButton,
-    QHBoxLayout, QFrame, QVBoxLayout,
+    QHBoxLayout, QFrame, QVBoxLayout, QMenu, QActionGroup,
 )
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QCursor, QIcon
 from PyQt5.QtCore import Qt, QPointF, QRectF, QSize, QThread
@@ -199,6 +199,15 @@ class ControlDock(QWidget):
         self.curvesPushButton.setIconSize(QSize(32, 32))
         self.curvesPushButton.setStyleSheet(button_style)
         self.curvesPushButton.toggled.connect(self.on_curves_toggled)
+
+        self.lookupPushButton.setIcon(create_lookup_icon())
+        self.lookupPushButton.setIconSize(QSize(32, 32))
+        self.lookupPushButton.setStyleSheet(button_style)
+        self.lookupPushButton.toggled.connect(self.on_lookup_toggled)
+        self.lookupPushButton.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.lookupPushButton.customContextMenuRequested.connect(self._lookup_menu)
+        self.lookupPushButton.setToolTip("Look up known objects in the field of view "
+                                         "(NED or SIMBAD; right-click to choose)")
 
         self.logScalePushButton.setStyleSheet(button_style)
         self.logScalePushButton.toggled.connect(self.on_log_scale_toggled)
@@ -620,11 +629,20 @@ class ControlDock(QWidget):
         if not pixmap or pixmap.isNull():
             self.set_black_squares()
             return
-        scaled_pixmap = pixmap.scaled(
-            self.preview_label.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation
-        )
+        # Rescaling the full-resolution image is O(pixels) (70-350 ms for
+        # 100-250 Mpx) and update_preview() runs on every scrollbar step, so
+        # the thumbnail is built once per (image, label size) and only the
+        # view rectangle is redrawn on top of a copy of it afterwards.
+        key = (pixmap.cacheKey(), self.preview_label.width(), self.preview_label.height())
+        cached = getattr(self, "_thumb_cache", None)
+        if cached is None or cached[0] != key:
+            thumb = pixmap.scaled(
+                self.preview_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+            self._thumb_cache = cached = (key, thumb)
+        scaled_pixmap = cached[1].copy()
         painter = QPainter(scaled_pixmap)
         painter.setPen(QPen(Qt.white, 2))
         if self.viewer:
@@ -647,7 +665,13 @@ class ControlDock(QWidget):
             return
         img_x = int(scene_pos.x())
         img_y = int(scene_pos.y())
-        image = self.viewer.last_pixmap.toImage()
+        # pixmap -> QImage conversion of the whole frame is costly (up to
+        # ~10 ms at 250 Mpx) and this runs on every mouse move: do it once.
+        pm = self.viewer.last_pixmap
+        cached = getattr(self, "_magnifier_image", None)
+        if cached is None or cached[0] != pm.cacheKey():
+            self._magnifier_image = cached = (pm.cacheKey(), pm.toImage())
+        image = cached[1]
         img_width = image.width()
         img_height = image.height()
         box_size = 50
@@ -780,6 +804,58 @@ class ControlDock(QWidget):
         """Uncheck curvesPushButton when the CurvesDialog is closed via its own Close button."""
         if self.curvesPushButton:
             self.curvesPushButton.setChecked(False)
+
+    def on_lookup_toggled(self, checked):
+        """
+        Look-up button: ON queries SIMBAD for the field of view and overlays
+        green circles; OFF removes the circles and discards the catalog.
+        The query runs in the background (see simbad_lookup.SimbadManager).
+        """
+        if not self.viewer:
+            return
+        if checked:
+            if not self.viewer.simbad.start_lookup():
+                self.set_lookup_checked(False)
+        else:
+            self.viewer.simbad.clear()
+            self.viewer.update_status(f"{self.viewer.simbad.source} overlay cleared.", 3000)
+
+    def _lookup_menu(self, pos):
+        """Right-click on the look-up button: choose the catalogue service."""
+        if not self.viewer:
+            return
+        menu = QMenu(self.lookupPushButton)
+        group = QActionGroup(menu)
+        group.setExclusive(True)
+        current = self.viewer.simbad.source
+        for name, hint in (("NED", "NED – extragalactic: galaxies, AGN, redshifts"),
+                           ("SIMBAD", "SIMBAD – all objects, strongest for stars")):
+            action = menu.addAction(hint)
+            action.setCheckable(True)
+            action.setChecked(name == current)
+            group.addAction(action)
+            action.triggered.connect(lambda _checked=False, n=name: self.on_lookup_source_chosen(n))
+        self._lookup_menu_obj = menu                  # kept for inspection/tests
+        menu.exec_(self.lookupPushButton.mapToGlobal(pos))
+
+    def on_lookup_source_chosen(self, name: str):
+        """Switch the look-up service; re-run the query if the overlay is on."""
+        if not self.viewer or not self.viewer.simbad.set_source(name):
+            return
+        self.lookupPushButton.setToolTip(f"Look up known objects in the field of view in {name} "
+                                         "(right-click to choose NED or SIMBAD)")
+        if self.lookupPushButton.isChecked():
+            if not self.viewer.simbad.start_lookup():          # clears the old overlay first
+                self.set_lookup_checked(False)
+        else:
+            self.viewer.update_status(f"Look-up service: {name}.", 3000)
+
+    def set_lookup_checked(self, checked: bool):
+        """Set the look-up button state without triggering on_lookup_toggled."""
+        if self.lookupPushButton:
+            self.lookupPushButton.blockSignals(True)
+            self.lookupPushButton.setChecked(checked)
+            self.lookupPushButton.blockSignals(False)
 
     def close_curves_dialog(self):
         """

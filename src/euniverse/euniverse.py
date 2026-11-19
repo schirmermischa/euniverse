@@ -33,7 +33,7 @@ from pathlib import Path
 from importlib.metadata import version, PackageNotFoundError
 
 from PyQt5.QtWidgets import QApplication, QMainWindow, QDockWidget, QWidget, QMessageBox
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 
 from .image_viewer import ImageViewer
 from .control_dock import ControlDock
@@ -59,7 +59,10 @@ class MainWindow(QMainWindow):
         self.resize(1280, 1080)
 
         if initial_file:
-            self._load_initial_file(initial_file)
+            # Start loading only once the window is shown and the event loop is
+            # running: a wait cursor set earlier (no window yet) is never
+            # displayed, and an error dialog would appear before the main window.
+            QTimer.singleShot(0, lambda: self._load_initial_file(initial_file))
 
     def _load_initial_file(self, path):
         """
@@ -112,6 +115,22 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Critical Error", message)
         sys.exit(1)
 
+def _prefer_xcb_on_wayland():
+    """
+    Qt5's native Wayland backend is slow and flaky for this viewer (sluggish
+    panning, load hangs, "requestActivate" warnings), whereas the same code
+    runs fast through XWayland.  On a Wayland session, ask Qt to try xcb
+    first and fall back to Wayland if XWayland is unavailable.
+
+    An explicit QT_QPA_PLATFORM always wins; set EUNIVERSE_NATIVE_WAYLAND=1
+    to keep Qt's own choice.
+    """
+    if os.environ.get("QT_QPA_PLATFORM") or os.environ.get("EUNIVERSE_NATIVE_WAYLAND"):
+        return
+    if os.environ.get("XDG_SESSION_TYPE") == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
+        os.environ["QT_QPA_PLATFORM"] = "xcb;wayland"
+
+
 def main():
     # 1. Versioning
     try:
@@ -131,6 +150,7 @@ def main():
         logger.setLevel(logging.DEBUG)
 
     # 3. Application Lifecycle
+    _prefer_xcb_on_wayland()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     

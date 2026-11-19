@@ -79,6 +79,7 @@ from .image_exporter  import ImageExporter
 from .workers         import TiffLoader
 from .wcs_utils       import WCSConverter, InvalidWCSError
 from .curve_math      import eval_curve
+from .simbad_lookup   import SimbadManager
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +221,8 @@ class ImageViewer(QGraphicsView):
         # ImageExporter handles all PNG save / screenshot operations
         self.exporter   = ImageExporter(self)
         self.status_bar = QStatusBar()
+        # SIMBAD look-up overlay (green circles; see simbad_lookup.py)
+        self.simbad     = SimbadManager(self)
 
         # Refresh the navigator thumbnail whenever the user scrolls
         self.horizontalScrollBar().valueChanged.connect(self.refresh_preview)
@@ -323,6 +326,11 @@ class ImageViewer(QGraphicsView):
             self.load_thread.wait()
             self.load_thread = None
             self.load_worker = None
+            QApplication.restoreOverrideCursor()   # balances the aborted load's wait cursor
+
+        # Wait cursor is set here, on the GUI thread (never in the worker);
+        # on_image_loaded() / _on_loader_error() restore it.
+        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
 
         self.load_thread = QThread()
         self.load_worker = TiffLoader(path)
@@ -332,8 +340,13 @@ class ImageViewer(QGraphicsView):
         self.load_worker.finished.connect(self.load_thread.quit)
         self.load_worker.finished.connect(self.load_worker.deleteLater)
         self.load_worker.finished.connect(self.on_image_loaded)
-        self.load_worker.error.connect(self.on_load_error)
+        self.load_worker.error.connect(self._on_loader_error)
         self.load_thread.start()
+
+    def _on_loader_error(self, message: str):
+        """TiffLoader.error slot: report the failure and release the wait cursor."""
+        self.on_load_error(message)
+        QApplication.restoreOverrideCursor()
 
     def on_image_loaded(self, image: np.ndarray, metadata: dict, path: str):
         """
@@ -463,7 +476,11 @@ class ImageViewer(QGraphicsView):
 
         # 1. Annotation circles (must precede scene.clear)
         self.clear_annotations()
+        # SIMBAD circles are scene items too, and the retrieved sources
+        # belong to the outgoing image — drop them and release the button.
+        self.simbad.clear()
         if self.control_dock:
+            self.control_dock.set_lookup_checked(False)
             self.control_dock.set_black_squares()
             # A Curves dialog holds a histogram + dtype captured from the
             # image being replaced; it must not survive into the new load.
@@ -1407,6 +1424,10 @@ class ImageViewer(QGraphicsView):
         # zoom factor converts to the equivalent scene-space radius so the
         # click target stays the same physical size regardless of zoom level.
         hit_radius = 10.0 / max(self.scale_factor, 0.01)
+
+        # SIMBAD look-up circles: opens the details dialog for the hit source.
+        if self.simbad.handle_click(scene_pos, hit_radius):
+            return True
 
         # MER catalog ellipses — use the scene's BspTree spatial index to get
         # only the items near the click point instead of scanning all N items.
