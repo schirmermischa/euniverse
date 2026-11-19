@@ -65,6 +65,7 @@ import numpy as np
 from .generate_icons import *
 from .table_dialog import TableDialog
 from .catalog_plotter import PlotDialog
+from .curves_dialog import CurvesDialog
 from .workers import CsvUploader
 
 # Define NA as a recognized unit so the parser doesn't complain
@@ -93,6 +94,7 @@ class ControlDock(QWidget):
         self.viewcenter = None
         self.table_dialog = None
         self.plot_dialog = None
+        self.curves_dialog = None
         self.is_viewer_displaying_preview = False
         self.wcs_available = True
         self.init_ui()
@@ -136,6 +138,13 @@ class ControlDock(QWidget):
         self.max_slider.setMaximum(65535)
         self.max_slider.setValue(65535)
 
+        # Log-scale display state for the sliders — see
+        # _slider_pos_to_value/_value_to_slider_pos for the mapping.
+        # A UI display preference, not image-derived state, so it
+        # deliberately does NOT get reset on new image load (unlike e.g.
+        # curve_sessions in ImageViewer).
+        self.log_scale_enabled = False
+
         # Button stylesheet
         button_style = """
             QPushButton, QPushButton:checked, QPushButton:pressed {
@@ -171,11 +180,6 @@ class ControlDock(QWidget):
          """
 
         # Assign icons and stylesheet
-        self.sunglassesPushButton.setIcon(create_sunglasses_icon())
-        self.sunglassesPushButton.setIconSize(QSize(32, 32))
-        self.sunglassesPushButton.setStyleSheet(button_style)
-        self.sunglassesPushButton.toggled.connect(self.on_sunglasses_toggled)
-
         self.MER_PushButton.setIcon(create_MER_icon())
         self.MER_PushButton.setIconSize(QSize(32, 32))
         self.MER_PushButton.setStyleSheet(button_style)
@@ -190,6 +194,14 @@ class ControlDock(QWidget):
         self.photoPushButton.setIconSize(QSize(32,32))
         self.photoPushButton.setStyleSheet(button_style_photo)
         self.photoPushButton.toggled.connect(self.photoPushButton_requested)
+
+        self.curvesPushButton.setIcon(create_curves_icon())
+        self.curvesPushButton.setIconSize(QSize(32, 32))
+        self.curvesPushButton.setStyleSheet(button_style)
+        self.curvesPushButton.toggled.connect(self.on_curves_toggled)
+
+        self.logScalePushButton.setStyleSheet(button_style)
+        self.logScalePushButton.toggled.connect(self.on_log_scale_toggled)
 
         # Helper to create the dual-state icon
         def make_toggle_icon(self, icon_func):
@@ -341,14 +353,18 @@ class ControlDock(QWidget):
     def slider_changed(self):
         # Fast numexpr preview on the pre-captured crop
         if self.contrast_callback:
-            self.contrast_callback(self.min_slider.value(), self.max_slider.value())
+            min_val = self._slider_pos_to_value(self.min_slider.value(), is_min=True)
+            max_val = self._slider_pos_to_value(self.max_slider.value(), is_min=False)
+            self.contrast_callback(min_val, max_val)
 
     def slider_released(self):
         # Full LUT pass on the entire original_image
         if self.full_contrast_callback:
             QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
             QApplication.processEvents()
-            self.full_contrast_callback(self.min_slider.value(), self.max_slider.value())
+            min_val = self._slider_pos_to_value(self.min_slider.value(), is_min=True)
+            max_val = self._slider_pos_to_value(self.max_slider.value(), is_min=False)
+            self.full_contrast_callback(min_val, max_val)
             QApplication.restoreOverrideCursor()
         # Discard the preview crop now that the full-image LUT pass is done.
         # Using the named method keeps us from poking private attributes directly.
@@ -358,7 +374,82 @@ class ControlDock(QWidget):
             self.viewer.toggle_MER()
         # Restore scroll position
         self.viewer.restore_view_center(self.viewcenter)
-                
+
+    # ------------------------------------------------------------------
+    # Log-scale slider mapping
+    # ------------------------------------------------------------------
+    # QSlider is inherently linear/integer, so its internal range stays
+    # 0..65535 in both modes — what changes is how that raw position maps
+    # to the actual pixel value used for the contrast stretch.
+    #
+    # Only min_slider (the black point) gets the asinh treatment; max_slider
+    # (the white point) always stays linear. The motivation for log-like
+    # precision is specifically that shadow/black-point detail gets
+    # compressed near zero — the white point doesn't have that problem, and
+    # giving it the same treatment made it uncomfortably twitchy: any
+    # single mapping that buys extra precision at the low end necessarily
+    # spends it by making the high end coarser (a slider only has 65535
+    # discrete positions to divide up), which is a bad trade for a control
+    # that's usually parked somewhere in the upper half of the range.
+    #
+    # Uses an asinh (inverse hyperbolic sine) stretch for the min slider —
+    # the same family used for astronomical display stretches (Lupton et
+    # al. 2004) — rather than a true logarithm, for the same reason it's
+    # used there: sinh/asinh are smooth and well-behaved through v=0 (no
+    # singularity, unlike log), so position 0 maps to value 0 exactly, no
+    # special-casing needed, while still approaching logarithmic behavior
+    # away from zero.
+    #
+    # _ASINH_BETA is the softening parameter — also the approximate
+    # crossover value below which the mapping behaves close to linear and
+    # above which it starts compressing logarithmically (asinh(x) ~ x for
+    # x << beta, ~ln(2x) for x >> beta). 3600 gives roughly a 5x precision
+    # improvement over linear for values in the low end (e.g. ~7.6% of the
+    # slider's travel for values 0-1000, vs. ~1.5% in linear mode).
+    _SLIDER_RANGE = 65535
+    _ASINH_BETA   = 3600.0
+    _ASINH_SPAN   = np.arcsinh(_SLIDER_RANGE / _ASINH_BETA)
+
+    def _slider_pos_to_value(self, pos: int, is_min: bool) -> int:
+        """
+        Raw QSlider position (0..65535) -> actual pixel value.
+
+        is_min selects which slider this position came from: only the
+        min (black-point) slider is affected by log_scale_enabled — the
+        max (white-point) slider is always linear, position == value.
+        """
+        if not self.log_scale_enabled or not is_min:
+            return pos
+        p_norm = pos / self._SLIDER_RANGE
+        return int(round(self._ASINH_BETA * np.sinh(p_norm * self._ASINH_SPAN)))
+
+    def _value_to_slider_pos(self, value: int, is_min: bool) -> int:
+        """Inverse of _slider_pos_to_value — actual pixel value -> raw QSlider position."""
+        if not self.log_scale_enabled or not is_min:
+            return int(value)
+        value = max(0, min(self._SLIDER_RANGE, value))
+        p_norm = np.arcsinh(value / self._ASINH_BETA) / self._ASINH_SPAN
+        return int(round(p_norm * self._SLIDER_RANGE))
+
+    def on_log_scale_toggled(self, checked):
+        """
+        Switch the black-point (min) slider between linear and logarithmic
+        (asinh) display — the white-point (max) slider is always linear,
+        so it's unaffected by this toggle.
+
+        Repositions min_slider so the actual pixel value it represents
+        stays the same across the switch — toggling this is a display-mode
+        change only, not a contrast change, so the currently rendered
+        image doesn't need to be touched at all.
+        """
+        old_min_value = self._slider_pos_to_value(self.min_slider.value(), is_min=True)
+
+        self.log_scale_enabled = checked
+
+        self.min_slider.blockSignals(True)
+        self.min_slider.setValue(self._value_to_slider_pos(old_min_value, is_min=True))
+        self.min_slider.blockSignals(False)
+
     def degrees_to_sexagesimal(self, ra, dec):
         ra_hours = ra / 15.0
         ra_h = int(ra_hours)
@@ -634,9 +725,6 @@ class ControlDock(QWidget):
         self.viewer.centerOn(center_point)
         self.viewer.refresh_preview()
 
-    def on_sunglasses_toggled(self, checked):
-        pass
-
     def on_plot_toggled(self, checked):
         if checked:
             if self.viewer and self.viewer.catalog_manager:
@@ -668,6 +756,44 @@ class ControlDock(QWidget):
         """
         if self.plotPushButton:
             self.plotPushButton.setChecked(False)
+
+    def on_curves_toggled(self, checked):
+        if checked:
+            if self.viewer and self.viewer.original_image is not None:
+                if self.curves_dialog is not None:
+                    self.curves_dialog.close()
+                    self.curves_dialog = None
+                self.curves_dialog = CurvesDialog(self.viewer, parent=self)
+                self.curves_dialog.finished.connect(self.on_curves_dialog_closed)
+                self.curves_dialog.show()
+            else:
+                print("Error: No image loaded — nothing for Curves to adjust.")
+                self.curvesPushButton.blockSignals(True)
+                self.curvesPushButton.setChecked(False)
+                self.curvesPushButton.blockSignals(False)
+        else:
+            if self.curves_dialog is not None:
+                self.curves_dialog.close()
+                self.curves_dialog = None
+
+    def on_curves_dialog_closed(self):
+        """Uncheck curvesPushButton when the CurvesDialog is closed via its own Close button."""
+        if self.curvesPushButton:
+            self.curvesPushButton.setChecked(False)
+
+    def close_curves_dialog(self):
+        """
+        Called by ImageViewer.reset() before a new image replaces the
+        current one — a CurvesDialog holds a histogram and dtype captured
+        from the outgoing image, so it can't be left open across a load.
+        """
+        if self.curves_dialog is not None:
+            self.curves_dialog.close()
+            self.curves_dialog = None
+        if self.curvesPushButton:
+            self.curvesPushButton.blockSignals(True)
+            self.curvesPushButton.setChecked(False)
+            self.curvesPushButton.blockSignals(False)
 
 
 #    def on_load_image(self):
@@ -742,7 +868,9 @@ class ControlDock(QWidget):
         if self.plot_dialog:
             self.plot_dialog.close()
             self.plot_dialog = None
-            
+
+        self.close_curves_dialog()
+
         # Ensure buttons reflect the new empty state
         self.MER_PushButton.setChecked(False)
         self.plotPushButton.setChecked(False)

@@ -78,6 +78,7 @@ from .catalog_manager import CatalogManager
 from .image_exporter  import ImageExporter
 from .workers         import TiffLoader
 from .wcs_utils       import WCSConverter, InvalidWCSError
+from .curve_math      import eval_curve
 
 logger = logging.getLogger(__name__)
 
@@ -156,8 +157,32 @@ class ImageViewer(QGraphicsView):
         self.load_worker = None
 
         # ---- Contrast engine state ----
-        # Maps (min_val, max_val) -> uint8 numpy LUT array
+        # Maps (min_val, max_val) -> uint8 numpy LUT array (linear stretch only)
         self.contrast_luts16: dict = {}
+        # Every applied Curves-dialog session, stored as its RAW (xs, ys)
+        # control points (see CurveWidget.get_control_points) — never as a
+        # pre-rounded lookup table. This is deliberate: composing N curve
+        # sessions by chaining pre-rounded uint8 tables (old design)
+        # re-quantizes at every step, and after 2-3 applications the
+        # surviving set of distinct output values collapses, showing up as
+        # a comb/discrete histogram — repeated 8-bit banding. Keeping the
+        # lossless control points instead, and only ever rounding once at
+        # the very end of current_display_lut(), avoids that entirely:
+        # every render recomposes the full chain from the raw 16-bit data.
+        # Reset to [] on new image load (see reset()) since it's
+        # meaningless for a different tile.
+        self.curve_sessions: list = []
+        # The (min_val, max_val) the linear stretch was last set to — kept
+        # as plain ints, NOT as a cached uint8 LUT, specifically so
+        # current_display_lut() can recompute the linear stretch directly
+        # in float64 from scratch every time (see there for why: starting
+        # curve composition from an already-uint8-rounded base LUT would
+        # cap every curve session's input to 256 distinct values from the
+        # very first step, silently reintroducing the same banding problem
+        # curve_sessions was designed to avoid, just one level earlier).
+        self._last_min_val = 0
+        self._last_max_val = 65535
+
         # Keeps the numpy buffer alive while QImage holds a raw pointer to it
         self._contrast_buffer         = None
         # Viewport crop captured once on slider_pressed for the live preview path
@@ -440,6 +465,12 @@ class ImageViewer(QGraphicsView):
         self.clear_annotations()
         if self.control_dock:
             self.control_dock.set_black_squares()
+            # A Curves dialog holds a histogram + dtype captured from the
+            # image being replaced; it must not survive into the new load.
+            # (Note: this is done here rather than in ControlDock's
+            # reset_ui_state(), which is never actually called anywhere in
+            # the current code — pre-existing, unrelated to Curves.)
+            self.control_dock.close_curves_dialog()
 
         # 2. MER overlays
         self.clear_MER()
@@ -459,6 +490,14 @@ class ImageViewer(QGraphicsView):
         self._preview_crop_raw        = None
         self._preview_crop_scene_pos  = None
         self._preview_crop_scene_size = None
+        # Per-image state (curve_sessions) or derived from the outgoing
+        # image's dtype (contrast_luts16 keys) — a curve or cached LUT
+        # from the previous tile has no valid meaning for a different one,
+        # so all of it is dropped here rather than carried over.
+        self.curve_sessions   = []
+        self._last_min_val   = 0
+        self._last_max_val   = 65535
+        self.contrast_luts16 = {}
 
         # 6. Scene
         self.scene.clear()
@@ -653,29 +692,6 @@ class ImageViewer(QGraphicsView):
     #      updates image_item pixmap in-place. sceneRect never changes.
     # ------------------------------------------------------------------
 
-    _MAX_LUT_CACHE = 64   # Evict oldest entries beyond this many cached LUTs
-
-    def _trim_lut_cache(self, cache: dict):
-        """Evict oldest cache entries when cache exceeds _MAX_LUT_CACHE entries."""
-        while len(cache) > self._MAX_LUT_CACHE:
-            cache.pop(next(iter(cache)))
-
-    def create_contrast_lut(self, min_val, max_val,
-                            input_dtype, output_dtype=np.uint8) -> np.ndarray:
-        """
-        Build a linear-stretch lookup table: input_dtype values → uint8 [0..255].
-
-        Values below min_val → 0, above max_val → 255.
-        The 65 536-entry float32 intermediate fits in L2 cache, so plain numpy
-        is sufficient here.
-        """
-        n    = np.iinfo(input_dtype).max + 1
-        diff = float(max_val - min_val)
-        if diff == 0:
-            return np.full(n, 255, dtype=output_dtype)
-        indices = np.arange(n, dtype=np.float32)
-        return np.clip((indices - min_val) * (255.0 / diff), 0, 255).astype(output_dtype)
-
     def capture_preview_crop(self):
         """
         Slice the currently visible viewport region from original_image and
@@ -764,6 +780,30 @@ class ImageViewer(QGraphicsView):
             np.clip(self._preview_float_buf, 0, 255, out=self._preview_float_buf)
             out = self._preview_float_buf.astype(np.uint8)  # final copy for QImage
 
+        # Compose the persisted Curves-dialog sessions on top of the linear
+        # stretch, if any have been applied — sliders and curves are meant
+        # to stack (moving a slider re-stretches the base image, but a
+        # previously-applied curve's shape should still show through).
+        # This only reflects sessions already *committed* (via Apply and
+        # Close in a previous Curves session) — an in-progress, not-yet-
+        # applied Curves dialog editing session is intentionally invisible
+        # to slider dragging; the two aren't meant to be edited
+        # concurrently in the same interaction.
+        #
+        # Composed here as a small 256-entry LUT rather than going through
+        # current_display_lut()'s full raw-data recomposition: `out` is
+        # already a uint8 crop at this point (this is the fast slider-drag
+        # preview path, deliberately using cheap float32 crop arithmetic
+        # for the base stretch rather than a 65536-entry LUT), so a second
+        # 8-bit rounding here is unavoidable — but that's fine, since this
+        # is only ever a transient, recomputed-every-frame preview that's
+        # discarded on release; it never feeds back into curve_sessions,
+        # so it can't cause the repeated-quantization banding that curve
+        # composition avoids elsewhere.
+        lut256 = self._cumulative_curve_lut256()
+        if lut256 is not None:
+            out = lut256[out]
+
         stride = c * w
         # Keep buffer alive — QImage holds a raw pointer, not a copy
         self._contrast_buffer = out
@@ -786,23 +826,160 @@ class ImageViewer(QGraphicsView):
 
     def apply_contrast(self, min_val: int, max_val: int):
         """
-        Full-image LUT pass: build / look up a uint16→uint8 LUT, apply it to
-        original_image, store the result as self.qimage, and update the scene.
+        Full-image pass for the min/max sliders: remember (min_val,
+        max_val) as the current base for composition and apply it,
+        composed with every committed Curves session, via
+        current_display_lut() — sliders and curves stack rather than one
+        replacing the other.
 
         Called on slider release and on initial image load.
-        Always restores image_item to position (0,0) and rebuilds sceneRect.
         """
         if self.original_image is None:
             return
+        self._last_min_val, self._last_max_val = min_val, max_val
+        self._apply_full_lut(self.current_display_lut())
 
-        lut_key = (min_val, max_val)
-        if lut_key not in self.contrast_luts16:
-            self.contrast_luts16[lut_key] = self.create_contrast_lut(
-                min_val, max_val, self.original_image.dtype, np.uint8
-            )
-            self._trim_lut_cache(self.contrast_luts16)
-        lut = self.contrast_luts16[lut_key]
+    def current_display_lut(self, extra_points=None,
+                             ignore_cumulative: bool = False) -> np.ndarray:
+        """
+        Compose the full display transform — [linear min/max stretch] then
+        every committed Curves session in curve_sessions, in order, then
+        optionally one more (xs, ys) curve not yet committed — into a
+        single 65536-entry uint8 LUT ready to index original_image
+        (uint16) directly.
 
+        Rebuilt from scratch on every call, entirely in float64, with
+        rounding to uint8 happening exactly once at the very end —
+        including the linear min/max stretch itself, which is recomputed
+        here directly from (_last_min_val, _last_max_val) rather than
+        reusing contrast_luts16's cached *uint8* array. That distinction
+        matters: starting curve composition from an already-uint8-rounded
+        base would cap every session's input to only 256 distinct values
+        from the very first step, silently reintroducing the same
+        banding problem one level earlier than the fix for it — a
+        mistake an earlier version of this method actually made.
+
+        Each committed session is stored as raw control points (see
+        CurveWidget.get_control_points), never as a pre-rounded table, so
+        chaining several curves here never re-quantizes an
+        already-quantized intermediate result — every render starts fresh
+        from the original 16-bit data. Composing pre-rounded 256-entry
+        tables instead (an earlier version of this did exactly that) is
+        what caused a visibly discrete/comb-shaped histogram after just
+        2-3 applied curves: each application could only ever re-space an
+        already-shrunken set of surviving output values, never recover
+        the resolution lost to the previous round's rounding.
+
+        extra_points
+            An additional (xs, ys) control-point pair to apply on top —
+            e.g. a Curves dialog's in-progress session curve that hasn't
+            been committed to curve_sessions yet (see
+            CurvesDialog._on_curve_changed). None means "just the
+            committed state".
+        ignore_cumulative
+            Skip curve_sessions entirely — used by the Curves dialog's
+            "Restore Original Scaling" while it's pending (not yet
+            applied): the live preview should show the plain linear
+            stretch with none of the previously-applied curves, without
+            actually clearing curve_sessions until the user commits via
+            Apply and Close.
+        """
+        min_val, max_val = self._last_min_val, self._last_max_val
+        diff = float(max_val - min_val)
+        raw  = np.arange(65536, dtype=np.float64)
+        if diff == 0:
+            values = np.ones(65536, dtype=np.float64)
+        else:
+            values = np.clip((raw - min_val) / diff, 0.0, 1.0)   # full-precision, 65536 entries
+
+        sessions = [] if ignore_cumulative else self.curve_sessions
+        for xs, ys in sessions:
+            values = np.clip(eval_curve(xs, ys, values), 0.0, 1.0)
+        if extra_points is not None:
+            xs, ys = extra_points
+            values = np.clip(eval_curve(xs, ys, values), 0.0, 1.0)
+
+        return np.round(values * 255).astype(np.uint8)
+
+    def _cumulative_curve_lut256(self, ignore_cumulative: bool = False):
+        """
+        Compose curve_sessions ONLY (not the base linear stretch) into a
+        small 256-entry uint8 LUT, for apply_preview_contrast()'s fast
+        slider-drag path — see the comment there for why an 8-bit LUT is
+        acceptable in that one spot specifically: it's a transient,
+        recomputed-every-frame preview that's discarded on release, never
+        stored, so it can't cause the compounding-rounding problem that
+        current_display_lut() avoids for anything that actually persists.
+
+        Returns None if there is nothing to compose (no committed sessions,
+        or ignore_cumulative), so callers can skip the lookup entirely.
+        """
+        if ignore_cumulative or not self.curve_sessions:
+            return None
+        values = np.arange(256, dtype=np.float64) / 255.0
+        for xs, ys in self.curve_sessions:
+            values = np.clip(eval_curve(xs, ys, values), 0.0, 1.0)
+        return np.round(values * 255).astype(np.uint8)
+
+    def apply_curve_full(self, control_points, clear_previous: bool = False):
+        """
+        Commit a Curves-dialog session: append *control_points* (an
+        (xs, ys) pair from CurveWidget.get_control_points — the exact,
+        un-rounded points the user drew) to curve_sessions, then render.
+
+        clear_previous
+            If True (the dialog's "Restore Original Scaling" was used
+            this session), every previously-committed session is dropped
+            first — discarding all prior curves rather than stacking on
+            top of them — before *control_points* is appended.
+        """
+        if self.original_image is None:
+            return
+        if clear_previous:
+            self.curve_sessions = []
+        self.curve_sessions.append(control_points)
+        self._apply_full_lut(self.current_display_lut())
+
+    def _show_current_pixmap(self):
+        """
+        Put self.last_pixmap on image_item at (0,0) with an identity
+        transform — the "not currently showing a live preview" display
+        state. Shared by _apply_full_lut() (right after computing a new
+        pixmap) and restore_full_display() (reusing the existing one).
+        """
+        if self.image_item is None or self.last_pixmap is None:
+            return
+        self.image_item.setPixmap(self.last_pixmap)
+        self.image_item.setPos(0, 0)
+        self.image_item.setTransform(QTransform())   # clear any preview scale
+        self.is_displaying_preview = False
+
+    def restore_full_display(self):
+        """
+        Revert the scene to the last *committed* full-image render,
+        discarding any live-preview-only display changes.
+
+        Used by the Curves dialog's Cancel path: apply_curve_preview()
+        only ever touches image_item's pixmap/transform for the crop
+        preview — it never writes to original_image/qimage/last_pixmap,
+        nor to curve_sessions (that only happens in apply_curve_full, on
+        commit) — so "cancelling" a curve edit is just putting
+        last_pixmap back, with no need to recompute anything.
+        """
+        self._show_current_pixmap()
+
+    def _apply_full_lut(self, lut: np.ndarray):
+        """
+        Shared body of apply_contrast() / apply_curve_full(): index
+        original_image through *lut* (a single 65536-entry uint8 LUT,
+        already composed via current_display_lut() — same LUT applied to
+        every channel, since we only ever support one combined tone
+        curve), store it as the new committed full-image render, and
+        display it.
+
+        Rebuilds sceneRect (the pixel dimensions never change here, but
+        keeping this in one place matches the pre-refactor behavior).
+        """
         stretched = lut[self.original_image]   # uint8, same shape as original_image
         h, w      = stretched.shape[:2]
         c         = 3 if stretched.ndim == 3 else 1
@@ -814,22 +991,64 @@ class ImageViewer(QGraphicsView):
             self._contrast_buffer.data, w, h, stride,
             QImage.Format_RGB888 if c == 3 else QImage.Format_Grayscale8
         )
-        pixmap           = QPixmap.fromImage(self.qimage)
-        self.last_pixmap = pixmap
-        self.is_displaying_preview = False
+        self.last_pixmap = QPixmap.fromImage(self.qimage)
 
-        if self.image_item:
-            self.image_item.setPixmap(pixmap)
-            self.image_item.setPos(0, 0)
-            self.image_item.setTransform(QTransform())   # clear any preview scale
-        else:
-            self.image_item = QGraphicsPixmapItem(pixmap)
+        if self.image_item is None:
+            self.image_item = QGraphicsPixmapItem(self.last_pixmap)
             self.scene.addItem(self.image_item)
 
+        self._show_current_pixmap()
         self.setSceneRect(QRectF(0, 0, w, h))
 
         if self.control_dock:
             self.control_dock.update_preview(self.last_pixmap)
+
+    def apply_curve_preview(self, control_points, ignore_cumulative: bool = False):
+        """
+        Fast preview pass for the Curves dialog: compose *control_points*
+        (an (xs, ys) pair, the in-progress session curve) with the current
+        base stretch and every committed session via current_display_lut(),
+        then apply that to the pre-captured viewport crop only.
+
+        ignore_cumulative
+            See current_display_lut() — set while "Restore Original
+            Scaling" is pending for this session, so the live preview
+            reflects the plain linear stretch with no curve at all.
+
+        Requires capture_preview_crop() to have been called first (done
+        once by CurvesDialog when the dialog opens, the same way
+        ControlDock.slider_pressed calls it before slider drags — just
+        once per Curves session rather than once per drag, since a curve
+        edit is typically many small drags in one sitting).
+        """
+        if self._preview_crop_raw is None:
+            return
+
+        crop = self._preview_crop_raw
+        h, w = crop.shape[:2]
+        c    = 3 if crop.ndim == 3 else 1
+
+        lut = self.current_display_lut(extra_points=control_points,
+                                        ignore_cumulative=ignore_cumulative)
+        out = lut[crop]   # uint8, same shape as crop
+
+        stride = c * w
+        self._contrast_buffer = out
+        qimg   = QImage(self._contrast_buffer.data, w, h, stride,
+                        QImage.Format_RGB888 if c == 3 else QImage.Format_Grayscale8)
+        pixmap = QPixmap.fromImage(qimg)
+
+        self.image_item.setPixmap(pixmap)
+        self.image_item.setPos(self._preview_crop_scene_pos)
+
+        if self._preview_crop_scene_size is not None:
+            sx = self._preview_crop_scene_size.width()  / w
+            sy = self._preview_crop_scene_size.height() / h
+            self.image_item.setTransform(QTransform.fromScale(sx, sy))
+        else:
+            self.image_item.setTransform(QTransform())
+
+        self.is_displaying_preview = True
 
     # ------------------------------------------------------------------
     # Zoom and viewport navigation

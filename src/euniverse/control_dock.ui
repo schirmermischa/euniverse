@@ -231,6 +231,37 @@
       </widget>
      </item>
      <item>
+      <widget class="QPushButton" name="curvesPushButton">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="minimumSize">
+        <size>
+         <width>32</width>
+         <height>32</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>32</width>
+         <height>32</height>
+        </size>
+       </property>
+       <property name="statusTip">
+        <string>Opens the curves dialog to adjust contrast</string>
+       </property>
+       <property name="checkable">
+        <bool>true</bool>
+       </property>
+       <property name="autoExclusive">
+        <bool>false</bool>
+       </property>
+      </widget>
+     </item>
+     <item>
       <spacer name="verticalSpacer_2">
        <property name="orientation">
         <enum>Qt::Vertical</enum>
@@ -410,8 +441,18 @@
        </property>
       </widget>
      </item>
+     <item row="2" column="0">
+      <widget class="QSlider" name="max_slider">
+       <property name="statusTip">
+        <string>Adjust the white point</string>
+       </property>
+       <property name="orientation">
+        <enum>Qt::Horizontal</enum>
+       </property>
+      </widget>
+     </item>
      <item row="1" column="1" rowspan="2">
-      <widget class="QPushButton" name="sunglassesPushButton">
+      <widget class="QPushButton" name="logScalePushButton">
        <property name="sizePolicy">
         <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
          <horstretch>0</horstretch>
@@ -420,34 +461,27 @@
        </property>
        <property name="minimumSize">
         <size>
-         <width>32</width>
+         <width>36</width>
          <height>32</height>
         </size>
        </property>
        <property name="maximumSize">
         <size>
-         <width>32</width>
+         <width>36</width>
          <height>32</height>
         </size>
        </property>
        <property name="statusTip">
-        <string>Dynamic-range setting for bright regions</string>
+        <string>Switch the black-point slider to a nonlinear (asinh) scale, for finer control at the low end</string>
+       </property>
+       <property name="text">
+        <string>NL</string>
        </property>
        <property name="checkable">
         <bool>true</bool>
        </property>
        <property name="autoExclusive">
         <bool>false</bool>
-       </property>
-      </widget>
-     </item>
-     <item row="2" column="0">
-      <widget class="QSlider" name="max_slider">
-       <property name="statusTip">
-        <string>Adjust the white point</string>
-       </property>
-       <property name="orientation">
-        <enum>Qt::Horizontal</enum>
        </property>
       </widget>
      </item>

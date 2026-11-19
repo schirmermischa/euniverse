@@ -244,6 +244,50 @@ def create_crosshair_icon():
     painter.end()
     return QIcon(pixmap)
 
+def create_curves_icon():
+    """
+    Generates a 32x32 icon showing a GIMP-style contrast curve: an S-shaped
+    curve running from the bottom-left to the top-right of a small axes box,
+    with small dots marking the black-point and white-point handles.
+    """
+    pixmap = QPixmap(32, 32)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+
+    box_left, box_top = 5, 5
+    box_size = 22
+
+    # Axes box
+    painter.setPen(QPen(Qt.black, 1))
+    painter.setBrush(Qt.NoBrush)
+    painter.drawRect(box_left, box_top, box_size, box_size)
+
+    # S-curve from bottom-left (shadows) to top-right (highlights) —
+    # two cubic segments through the box centre, echoing a typical
+    # contrast-boosting curve shape.
+    x0, y0 = box_left, box_top + box_size          # bottom-left  (black point)
+    x1, y1 = box_left + box_size, box_top           # top-right    (white point)
+    cx, cy = box_left + box_size / 2, box_top + box_size / 2
+
+    path = QPainterPath()
+    path.moveTo(x0, y0)
+    path.cubicTo(x0 + box_size * 0.55, y0, cx, cy, cx, cy)
+    path.cubicTo(cx, cy, x1 - box_size * 0.55, y1, x1, y1)
+
+    painter.setPen(QPen(QColor(30, 100, 200), 1.8))
+    painter.drawPath(path)
+
+    # Endpoint handles
+    painter.setPen(QPen(QColor(30, 100, 200), 1))
+    painter.setBrush(QBrush(Qt.white))
+    for hx, hy in ((x0, y0), (x1, y1)):
+        painter.drawEllipse(QRectF(hx - 1.6, hy - 1.6, 3.2, 3.2))
+
+    painter.end()
+    return QIcon(pixmap)
+
+
 def create_lasso_icon():
     """Creates a lasso selector icon for the toolbar."""
     pixmap = QPixmap(24, 24)
