@@ -288,6 +288,38 @@ def create_curves_icon():
     return QIcon(pixmap)
 
 
+def create_lookup_icon():
+    """
+    Generates a 32x32 icon for the SIMBAD look-up toggle: a magnifying glass
+    with a small green-circled star in the lens.
+    """
+    pixmap = QPixmap(32, 32)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+
+    # Handle (drawn first so the lens overlaps its end)
+    painter.setPen(QPen(QColor(60, 60, 60), 3.5, Qt.SolidLine, Qt.RoundCap))
+    painter.drawLine(20, 20, 27, 27)
+
+    # Lens
+    lens = QRectF(4, 4, 19, 19)
+    painter.setPen(QPen(QColor(60, 60, 60), 2))
+    painter.setBrush(QBrush(QColor(235, 245, 255)))
+    painter.drawEllipse(lens)
+
+    # Green circle around a star: what the overlay looks like
+    painter.setPen(QPen(QColor(0, 200, 0), 1.3))
+    painter.setBrush(Qt.NoBrush)
+    painter.drawEllipse(QRectF(8.5, 8.5, 10, 10))
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QBrush(QColor(30, 30, 30)))
+    painter.drawEllipse(QRectF(12, 12, 3, 3))
+
+    painter.end()
+    return QIcon(pixmap)
+
+
 def create_lasso_icon():
     """Creates a lasso selector icon for the toolbar."""
     pixmap = QPixmap(24, 24)

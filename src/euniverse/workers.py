@@ -89,10 +89,12 @@ class TiffLoader(QObject):
     def run(self):
         """Entry point — called by QThread.started signal."""
         try:
-            # Show the wait cursor while loading (safe to call from any thread
-            # via a queued connection; QApplication routes it to the GUI thread).
-            QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
-
+            # NOTE: no cursor handling here.  QApplication.setOverrideCursor()
+            # and restoreOverrideCursor() are GUI-thread-only; calling them
+            # from this worker thread made Qt start timers off-thread
+            # ("QObject::startTimer: Timers cannot be started from another
+            # thread", seen on Wayland).  ImageViewer.load_image() sets the
+            # wait cursor and the finished/error slots restore it.
             with tifffile.TiffFile(self.path) as tif:
                 image = tif.pages[0].asarray()
 
@@ -109,11 +111,9 @@ class TiffLoader(QObject):
 
         except ValueError as ve:
             self.error.emit(str(ve))
-            QApplication.restoreOverrideCursor()
 
         except Exception as e:
             self.error.emit(f"Unexpected error loading TIFF: {e}")
-            QApplication.restoreOverrideCursor()
 
 
 # ---------------------------------------------------------------------------

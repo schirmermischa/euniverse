@@ -200,6 +200,13 @@ class ControlDock(QWidget):
         self.curvesPushButton.setStyleSheet(button_style)
         self.curvesPushButton.toggled.connect(self.on_curves_toggled)
 
+        self.lookupPushButton.setIcon(create_lookup_icon())
+        self.lookupPushButton.setIconSize(QSize(32, 32))
+        self.lookupPushButton.setStyleSheet(button_style)
+        self.lookupPushButton.toggled.connect(self.on_lookup_toggled)
+        self.lookupPushButton.setToolTip("Look up known objects in the field of view: "
+                                         "NED (green circles) and SIMBAD (yellow squares)")
+
         self.logScalePushButton.setStyleSheet(button_style)
         self.logScalePushButton.toggled.connect(self.on_log_scale_toggled)
 
@@ -620,11 +627,20 @@ class ControlDock(QWidget):
         if not pixmap or pixmap.isNull():
             self.set_black_squares()
             return
-        scaled_pixmap = pixmap.scaled(
-            self.preview_label.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation
-        )
+        # Rescaling the full-resolution image is O(pixels) (70-350 ms for
+        # 100-250 Mpx) and update_preview() runs on every scrollbar step, so
+        # the thumbnail is built once per (image, label size) and only the
+        # view rectangle is redrawn on top of a copy of it afterwards.
+        key = (pixmap.cacheKey(), self.preview_label.width(), self.preview_label.height())
+        cached = getattr(self, "_thumb_cache", None)
+        if cached is None or cached[0] != key:
+            thumb = pixmap.scaled(
+                self.preview_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+            self._thumb_cache = cached = (key, thumb)
+        scaled_pixmap = cached[1].copy()
         painter = QPainter(scaled_pixmap)
         painter.setPen(QPen(Qt.white, 2))
         if self.viewer:
@@ -647,7 +663,13 @@ class ControlDock(QWidget):
             return
         img_x = int(scene_pos.x())
         img_y = int(scene_pos.y())
-        image = self.viewer.last_pixmap.toImage()
+        # pixmap -> QImage conversion of the whole frame is costly (up to
+        # ~10 ms at 250 Mpx) and this runs on every mouse move: do it once.
+        pm = self.viewer.last_pixmap
+        cached = getattr(self, "_magnifier_image", None)
+        if cached is None or cached[0] != pm.cacheKey():
+            self._magnifier_image = cached = (pm.cacheKey(), pm.toImage())
+        image = cached[1]
         img_width = image.width()
         img_height = image.height()
         box_size = 50
@@ -780,6 +802,29 @@ class ControlDock(QWidget):
         """Uncheck curvesPushButton when the CurvesDialog is closed via its own Close button."""
         if self.curvesPushButton:
             self.curvesPushButton.setChecked(False)
+
+    def on_lookup_toggled(self, checked):
+        """
+        Look-up button: ON queries NED and SIMBAD for the field of view and
+        overlays green circles (NED) and yellow squares (SIMBAD); OFF removes
+        them and discards the catalogs.  The queries run in the background
+        (see simbad_lookup.SimbadManager).
+        """
+        if not self.viewer:
+            return
+        if checked:
+            if not self.viewer.simbad.start_lookup():
+                self.set_lookup_checked(False)
+        else:
+            self.viewer.simbad.clear()
+            self.viewer.update_status("Look-up overlay cleared.", 3000)
+
+    def set_lookup_checked(self, checked: bool):
+        """Set the look-up button state without triggering on_lookup_toggled."""
+        if self.lookupPushButton:
+            self.lookupPushButton.blockSignals(True)
+            self.lookupPushButton.setChecked(checked)
+            self.lookupPushButton.blockSignals(False)
 
     def close_curves_dialog(self):
         """
