@@ -26,18 +26,21 @@
 # SOFTWARE.
 
 """
-simbad_lookup.py — NED + SIMBAD overlay for the displayed field of view
+simbad_lookup.py — NED + SIMBAD + cluster-catalogue overlay for the field of view
 =========================================================================
 Implements the dock's "look-up" toggle:
 
-  ON   Query NED and SIMBAD together (TAP/ADQL cone searches circumscribing
-       the image, in parallel background threads) and keep the objects that
-       fall inside the image.  NED objects get a green circle, SIMBAD objects
-       a yellow square.  Hovering a marker shows the object's name, type
-       (and NED redshift) in a tool-tip; left-clicking opens a dialog with
-       the record of that service (plus a link to its full web page).  A
-       table dialog with one tab per service opens when the first answer
-       arrives.  One service failing or being slow does not affect the other.
+  ON   Query NED, SIMBAD and a set of galaxy-cluster catalogues (Planck PSZ2,
+       SPT-SZ/ECS, ACT, MCXC incl. MACS, RCS, maxBCG, GMBCG, redMaPPer, WHL,
+       Abell; read from VizieR) together -- TAP/ADQL cone searches
+       circumscribing the image, in parallel background threads -- and keep
+       the objects that fall inside the image.  NED objects get a green
+       circle, SIMBAD objects a yellow square, cluster-catalogue entries a cyan
+       diamond.  Hovering a marker shows its name, type/catalogue (and
+       redshift) in a tool-tip; left-clicking opens a dialog with the record
+       (plus a link to the full web page).  A table dialog with one tab per
+       service opens when the first answer arrives.  One service failing or
+       being slow does not affect the others.
   OFF  Remove all markers and discard the retrieved catalogs.
 
 Pieces
@@ -71,14 +74,21 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from astropy.coordinates import SkyCoord
 
+try:
+    from PyQt5 import sip            # PyQt5 >= 5.11 ships its own sip; a top-level ``sip`` is not
+except ImportError:                  # guaranteed (e.g. the pip wheels on Windows)
+    import sip
+from .paths import cache_dir
 from PyQt5.QtCore import QEvent, QObject, QPointF, Qt, QRectF, QSettings, QTimer, QUrl, pyqtSignal
-from PyQt5.QtGui import QBrush, QColor, QDesktopServices, QFont, QPen
+from PyQt5.QtGui import QBrush, QColor, QDesktopServices, QFont, QPen, QPolygonF
 from PyQt5.QtWidgets import (
-    QAbstractItemView, QApplication, QDialog, QGraphicsEllipseItem, QGraphicsRectItem, QTabWidget,
+    QAbstractItemView, QApplication, QDialog, QGraphicsEllipseItem, QGraphicsPolygonItem, QGraphicsRectItem,
+    QTabWidget,
     QButtonGroup, QHBoxLayout, QHeaderView, QLabel, QMenu, QPlainTextEdit, QPushButton, QRadioButton, QToolTip,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
@@ -105,7 +115,8 @@ MAX_SOURCES  = 20000       # safety cap on rows requested from SIMBAD
 
 # Catalogue services.  NED (extragalactic: redshifts, galaxies, AGN) is the
 # default; SIMBAD (all objects, strongest for stars) is the alternative.
-SOURCES        = ("NED", "SIMBAD")      # both are always queried
+CLUSTERS       = "Clusters"
+SOURCES        = ("NED", "SIMBAD", CLUSTERS)      # all are always queried
 
 # NED: field query through its TAP service (single table "objdir"); aliases and
 # reference codes of one object through the ObjectLookup JSON service.
@@ -137,10 +148,43 @@ NED_TYPES = {
     "*": "Star", "**": "Double star", "!*": "Galactic star", "Other": "Other",
 }
 
+# Galaxy-cluster catalogues, all read from VizieR (CDS) through its TAP service.
+# Each entry: (label shown in the table, VizieR table or "catalogue/*" for every
+# table of a catalogue that has coordinates, ADS bibcode of the paper).
+# The columns (position, name, redshift) are not hard-coded: they are found
+# through the UCDs in VizieR's TAP_SCHEMA (see _pick_columns) and cached, so a
+# table that is laid out differently than expected still works, and one that
+# does not exist is reported and skipped instead of breaking the look-up.
+# IDs confirmed in VizieR/CDS documents: PSZ2, SPT-SZ (catalogue), MCXC, ACT DR5,
+# ACT-DR5 MCMF, redMaPPer DR8, GMBCG, maxBCG, RCS (tables 5 and 6), WHL.
+# SPT-ECS and Abell are from memory.  Set EUNIVERSE_NO_CLUSTERS=1 to switch the
+# cluster look-up off.
+VIZIER_TAP_URLS = ["https://tapvizier.cds.unistra.fr/TAPVizieR/tap/sync",
+                   "https://vizier.cfa.harvard.edu/TAPVizieR/tap/sync"]
+VIZIER_CATALOG_URL = "https://vizier.cds.unistra.fr/viz-bin/VizieR-2?-source="
+CLUSTER_TIMEOUT = 60       # seconds per socket operation
+CLUSTER_MAXREC  = 5000     # per table; a field holds far fewer clusters
+CLUSTER_WORKERS = 4        # tables queried in parallel
+CLUSTER_CATALOGS = [
+    ("Planck PSZ2",           "J/A+A/594/A27/psz2",      "2016A&A...594A..27P"),
+    ("SPT-SZ",                "J/ApJS/216/27/*",         "2015ApJS..216...27B"),
+    ("SPT-ECS",               "J/ApJS/247/25/*",         "2020ApJS..247...25B"),
+    ("ACT DR5",               "J/ApJS/253/3/*",          "2021ApJS..253....3H"),
+    ("ACT-DR5 MCMF",          "J/A+A/690/A322/catalog",  "2024A&A...690A.322K"),
+    ("MCXC (incl. MACS)",     "J/A+A/534/A109/mcxc",     "2011A&A...534A.109P"),
+    ("RCS",                   "J/ApJS/157/1/*",          "2005ApJS..157....1G"),
+    ("maxBCG (SDSS)",         "J/ApJ/660/239/*",         "2007ApJ...660..239K"),
+    ("GMBCG (SDSS)",          "J/ApJS/191/254/gmbcgdr7", "2010ApJS..191..254H"),
+    ("redMaPPer (SDSS DR8)",  "J/ApJS/224/1/cat_dr8",    "2016ApJS..224....1R"),
+    ("WHL (SDSS)",            "J/ApJS/199/34/*",         "2012ApJS..199...34W"),
+    ("Abell (ACO)",           "VII/110A/*",              "1989ApJS...70....1A"),
+]
+
 # Results of a field query are cached on disk (per field centre and size) so
 # toggling the look-up off and on, or reloading a tile, is instant.  Set the
 # environment variable EUNIVERSE_SIMBAD_NOCACHE=1 to bypass the cache, or
-# delete ~/.cache/euniverse/simbad to force fresh data.
+# delete the 'simbad' folder of the cache (~/.cache/euniverse on Linux,
+# %LOCALAPPDATA%\\euniverse on Windows) to force fresh data.
 CACHE_MAX_AGE_DAYS = 7
 SCHEMA_CACHE_DAYS  = 30     # column list / object-type definitions change rarely
 
@@ -149,6 +193,8 @@ CIRCLE_COLOR     = QColor(0, 255, 0)
 SQUARE_COLOR     = QColor(255, 215, 0)     # SIMBAD: yellow squares (NED: green circles)
 SQUARE_SCALE     = 1.5     # half-side of a SIMBAD square = radius * SQUARE_SCALE, so that a
                            # circle for the same object sits inside its square
+CLUSTER_COLOR   = QColor(0, 200, 255)      # cluster catalogues: cyan diamonds
+DIAMOND_SCALE    = 2.2     # half-diagonal of a cluster diamond = radius * DIAMOND_SCALE
 CIRCLE_WIDTH     = 1.5     # cosmetic: constant on screen at every zoom level
 CIRCLE_WIDTH_SEL = 3.0
 DEFAULT_RADIUS_ARCSEC = 1.5   # circle size for objects without a known extent
@@ -448,8 +494,7 @@ def _to_float(value):
 # ---------------------------------------------------------------------------
 
 def _cache_dir() -> str:
-    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-    return os.path.join(base, "euniverse", "simbad")
+    return cache_dir("simbad")
 
 
 def _json_get(name: str, max_age_days: float):
@@ -488,7 +533,9 @@ def _cache_path(ra: float, dec: float, radius: float, source: str = "SIMBAD"):
     if os.environ.get("EUNIVERSE_SIMBAD_NOCACHE"):
         return None
     spec = [round(ra, 5), round(dec, 5), round(radius, 5), MAX_SOURCES,
-            [c for c, _ in FIELDS] if source == "SIMBAD" else [source] + NED_COLUMNS]
+            [c for c, _ in FIELDS] if source == "SIMBAD"
+            else [source] + NED_COLUMNS if source == "NED"
+            else [source] + [(label, spec) for label, spec, _ in CLUSTER_CATALOGS]]
     spec = json.dumps(spec)
     return f"field_{hashlib.sha1(spec.encode()).hexdigest()[:20]}.json.gz"
 
@@ -545,6 +592,15 @@ class _SourceCircle(_TipMixin, QGraphicsEllipseItem):
 
 class _SourceSquare(_TipMixin, QGraphicsRectItem):
     """SIMBAD object: yellow square."""
+
+
+class _SourceDiamond(_TipMixin, QGraphicsPolygonItem):
+    """Cluster-catalogue entry: cyan diamond."""
+
+    @classmethod
+    def around(cls, x: float, y: float, half: float):
+        return cls(QPolygonF([QPointF(x, y - half), QPointF(x + half, y),
+                              QPointF(x, y + half), QPointF(x - half, y)]))
 
 
 class SimbadQueryWorker(QObject):
@@ -856,6 +912,211 @@ class NedLookupWorker(QObject):
 
 
 # ---------------------------------------------------------------------------
+# Galaxy-cluster catalogues (VizieR)
+# ---------------------------------------------------------------------------
+
+def _clusters_enabled() -> bool:
+    return bool(CLUSTER_CATALOGS) and not os.environ.get("EUNIVERSE_NO_CLUSTERS")
+
+
+def _pick_columns(columns: list):
+    """
+    Choose the columns of one VizieR table from their UCDs.
+    *columns*: list of (column_name, ucd, datatype).  Returns a dict with
+    "ra", "dec" (required; numeric degrees), "name" and "z" (None if absent),
+    or None if the table has no usable position.
+    """
+    def numeric(dt: str) -> bool:
+        dt = (dt or "").lower()
+        return not dt or any(k in dt for k in ("double", "float", "real", "decimal"))
+
+    def first(test, usable=lambda c: True):
+        for name, ucd, dtype in columns:
+            if usable((name, ucd, dtype)) and test((ucd or "").strip().lower()):
+                return name
+        return None
+
+    plain = lambda c: not c[0].startswith("_") and numeric(c[2])       # prefer the table's own columns ...
+    anyc  = lambda c: numeric(c[2])                                    # ... over VizieR's computed _RAJ2000 etc.
+    ra = dec = None
+    for usable in (plain, anyc):
+        ra  = ra  or first(lambda u: u == "pos.eq.ra;meta.main", usable)  or first(lambda u: u.startswith("pos.eq.ra"), usable)
+        dec = dec or first(lambda u: u == "pos.eq.dec;meta.main", usable) or first(lambda u: u.startswith("pos.eq.dec"), usable)
+    if not ra or not dec:
+        return None
+    name = (first(lambda u: u == "meta.id;meta.main") or
+            first(lambda u: u.startswith("meta.id") and not u.startswith("meta.id.part")))
+    z = (first(lambda u: u == "src.redshift", lambda c: numeric(c[2])) or
+         first(lambda u: u.startswith("src.redshift") and "stat" not in u, lambda c: numeric(c[2])))
+    return {"ra": ra, "dec": dec, "name": name, "z": z}
+
+
+def _quote(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _schema_filter() -> str:
+    """WHERE clause selecting the TAP_SCHEMA rows of all configured tables."""
+    exact  = [spec for _, spec, _ in CLUSTER_CATALOGS if not spec.endswith("*")]
+    prefix = [spec[:-1] for _, spec, _ in CLUSTER_CATALOGS if spec.endswith("*")]
+    parts  = []
+    if exact:
+        parts.append("table_name IN (" + ", ".join("'" + t.replace("'", "''") + "'" for t in exact) + ")")
+    parts += ["table_name LIKE '" + p.replace("'", "''") + "%'" for p in prefix]
+    return " OR ".join(parts)
+
+
+def _cluster_tables(force: bool = False) -> dict:
+    """
+    {table: {"ra", "dec", "name", "z"}} for every configured table that exists
+    in VizieR and has coordinates.  One TAP_SCHEMA request, cached on disk for
+    30 days (and re-fetched if the catalogue list changed).
+    """
+    global _cluster_tables_cache
+    specs = [[label, spec] for label, spec, _ in CLUSTER_CATALOGS]
+    if not force:
+        if _cluster_tables_cache is not None:
+            return _cluster_tables_cache
+        got = _json_get("schema_clusters.json.gz", SCHEMA_CACHE_DAYS)
+        if got and isinstance(got[0], dict) and got[0].get("specs") == specs and got[0].get("tables"):
+            _cluster_tables_cache = got[0]["tables"]
+            return _cluster_tables_cache
+    rows = tap_query("SELECT table_name, column_name, ucd, datatype FROM TAP_SCHEMA.columns WHERE "
+                     + _schema_filter(), timeout=CLUSTER_TIMEOUT, urls=VIZIER_TAP_URLS, label="VizieR")
+    by_table = {}
+    for r in rows:
+        t = (r.get("table_name") or "").strip()
+        if t:
+            by_table.setdefault(t, []).append(((r.get("column_name") or "").strip(),
+                                               r.get("ucd") or "", r.get("datatype") or ""))
+    tables = {}
+    for t, cols in by_table.items():
+        picked = _pick_columns(cols)
+        if picked:
+            tables[t] = picked
+    if not tables:
+        raise SimbadError("VizieR knows none of the configured cluster tables with coordinates")
+    _cluster_tables_cache = tables
+    _json_put("schema_clusters.json.gz", {"specs": specs, "tables": tables})
+    return tables
+
+
+def _cluster_plan(tables: dict):
+    """-> ([(label, bibcode, table, columns)], [labels with no table in VizieR])"""
+    plan, missing = [], []
+    for label, spec, bib in CLUSTER_CATALOGS:
+        if spec.endswith("*"):
+            found = sorted(t for t in tables if t.startswith(spec[:-1]))
+        else:
+            found = [spec] if spec in tables else []
+        if not found:
+            missing.append(label)
+        plan += [(label, bib, t, tables[t]) for t in found]
+    return plan, missing
+
+
+def _vizier_catalog_id(table: str) -> str:
+    """'J/ApJS/216/27/table1' -> 'J/ApJS/216/27';  'VII/110A/table3' -> 'VII/110A'."""
+    parts = table.split("/")
+    return "/".join(parts[:4] if parts[0] == "J" else parts[:2])
+
+
+_cluster_tables_cache = None
+
+
+class ClusterQueryWorker(SimbadQueryWorker):
+    """
+    Cone-searches the configured galaxy-cluster catalogues in VizieR.  Same
+    signals as SimbadQueryWorker.  The tables are queried in parallel; one that
+    fails or is missing does not spoil the others (the failures are reported in
+    info["timing"]["failed"], and such a result is not cached).
+    """
+
+    source = CLUSTERS
+
+    def _one(self, item):
+        label, bib, table, cols = item
+        selected = [cols["name"], cols["ra"], cols["dec"], cols["z"]]
+        sel = ", ".join(_quote(c) for c in selected if c)
+        adql = (f"SELECT TOP {CLUSTER_MAXREC + 1} {sel} FROM {_quote(table)} "
+                f"WHERE 1=CONTAINS(POINT('ICRS', {_quote(cols['ra'])}, {_quote(cols['dec'])}), "
+                f"CIRCLE('ICRS', {self.ra:.8f}, {self.dec:.8f}, {self.radius:.8f}))")
+        stats = {}
+        raw = tap_query(adql, timeout=CLUSTER_TIMEOUT, urls=VIZIER_TAP_URLS, label="VizieR", stats=stats)
+        out = []
+        for k, r in enumerate(raw[:CLUSTER_MAXREC]):
+            r = {(key or "").strip().lower(): (v or "").strip() for key, v in r.items()}
+            name = r.get((cols["name"] or "").lower(), "") if cols["name"] else ""
+            out.append({
+                "main_id":      name or f"{label} #{k + 1}",
+                "ra":           r.get(cols["ra"].lower(), ""),
+                "dec":          r.get(cols["dec"].lower(), ""),
+                "otype":        label,
+                "rvz_redshift": r.get(cols["z"].lower(), "") if cols["z"] else "",
+                "coo_bibcode":  bib,
+                "_table":       table,
+            })
+        return out, len(raw) > CLUSTER_MAXREC, stats
+
+    def run(self):
+        try:
+            cache = _cache_path(self.ra, self.dec, self.radius, CLUSTERS)
+            hit = _cache_load(cache)
+            if hit:
+                rows, info, age = hit
+                info["timing"] = {"cached_days": age}
+                self.finished.emit(self.generation, rows, info)
+                return
+
+            t0 = time.monotonic()
+            extra = {}
+            if _cluster_tables_cache is None and not _json_get("schema_clusters.json.gz", SCHEMA_CACHE_DAYS):
+                self._stage("looking up the cluster catalogues in VizieR (first time only)")
+            t = time.monotonic()
+            tables = _cluster_tables()
+            extra["schema"] = time.monotonic() - t
+            plan, missing = _cluster_plan(tables)
+            errors = []                                    # queries that failed (transient: result not cached)
+            failed = [f"{label}: not in VizieR" for label in missing]
+
+            rows, truncated, done, mirrors = [], False, 0, set()
+            self._stage(f"querying {len(plan)} cluster tables", 0, 0)
+            with ThreadPoolExecutor(max_workers=CLUSTER_WORKERS) as pool:
+                futures = [(item, pool.submit(self._one, item)) for item in plan]
+                for item, fut in futures:
+                    try:
+                        got, cut, stats = fut.result()
+                    except SimbadError as e:
+                        errors.append(f"{item[0]}: {e}")
+                    else:
+                        rows += got
+                        truncated = truncated or cut
+                        if stats.get("mirror"):
+                            mirrors.add(stats["mirror"])
+                    done += 1
+                    self._stage(f"queried {done} of {len(plan)} cluster tables", len(rows), 0)
+
+            failed += errors
+            if plan and len(errors) == len(plan):
+                raise SimbadError("Could not query any cluster catalogue — " + "; ".join(errors))
+
+            labels = {label: (label, label) for label, _, _ in CLUSTER_CATALOGS}
+            info = {"truncated": truncated, "otypes": labels}
+            if not errors:
+                _cache_save(cache, rows, info)
+            timing = {"failed": failed, "schema": extra["schema"]}
+            if mirrors:
+                timing["mirror"] = ", ".join(sorted(mirrors))
+            info["timing"] = timing
+            self.finished.emit(self.generation, rows, info)
+
+        except SimbadError as e:
+            self.error.emit(self.generation, str(e))
+        except Exception as e:
+            self.error.emit(self.generation, f"Unexpected error during cluster look-up: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Details dialog
 # ---------------------------------------------------------------------------
 
@@ -906,16 +1167,34 @@ class SimbadDetailsDialog(QDialog):
 
     def show_source(self, src: dict, otypes: dict):
         name = src.get("main_id", "?")
+        cluster = src.get("_source") == CLUSTERS
         ned  = src.get("_source") == "NED"
-        service = "NED" if ned else "SIMBAD"
-        self.setWindowTitle(f"{service} – {name}")
-        self.open_button.setText(f"Open in {service}")
+        service = "NED" if ned else CLUSTERS if cluster else "SIMBAD"
+        self.alias_label.setVisible(not cluster)       # cluster catalogues have no alias service
+        self.alias_box.setVisible(not cluster)
+        if cluster:
+            catalog = src.get("otype", "")
+            self.setWindowTitle(f"{catalog} – {name}")
+            self.open_button.setText("Open catalogue in VizieR")
+            self._url = VIZIER_CATALOG_URL + urllib.parse.quote(_vizier_catalog_id(src.get("_table", "")), safe="/+")
+        else:
+            self.setWindowTitle(f"{service} – {name}")
+            self.open_button.setText(f"Open in {service}")
+            self._url = (NED_OBJECT_URL if ned else SIMBAD_ID_URL) + urllib.parse.quote(name)
         self.title_label.setText(name)
-        self._url = (NED_OBJECT_URL if ned else SIMBAD_ID_URL) + urllib.parse.quote(name)
         self._main_norm = " ".join(name.split())      # to drop it from the alias list
 
         rows = []                                     # (label, value, is_bibcode)
-        for column, label in (NED_FIELDS if ned else FIELDS):
+        if cluster:
+            rows.append(("Name", name, False))
+            rows.append(("Catalogue", src.get("otype", ""), False))
+            if (src.get("rvz_redshift") or "").strip():
+                rows.append(("Redshift", src["rvz_redshift"].strip(), False))
+            if (src.get("coo_bibcode") or "").strip():
+                rows.append(("Reference", src["coo_bibcode"].strip(), True))
+            if src.get("_table"):
+                rows.append(("VizieR table", src["_table"], False))
+        for column, label in (() if cluster else NED_FIELDS if ned else FIELDS):
             value = (src.get(column) or "").strip()
             if not value:
                 continue
@@ -1020,7 +1299,8 @@ class _SortItem(QTableWidgetItem):
 class _ServicePage(QWidget):
     """
     One tab of the table dialog: the objects one service found in the field of
-    view (name, type, coordinates, redshift and, for SIMBAD, a reference), or a
+    view (name, type, coordinates, redshift and, for SIMBAD and the cluster
+    catalogues, a reference), or a
     note while that service is still being queried / has failed.
 
     Signals (int = index into SimbadManager.sources)
@@ -1039,6 +1319,9 @@ class _ServicePage(QWidget):
     def __init__(self, service: str, fmt: str, parent=None):
         super().__init__(parent)
         self.service  = service
+        self.COLUMNS  = list(_ServicePage.COLUMNS)
+        if service == CLUSTERS:
+            self.COLUMNS[1] = "Catalogue"          # the catalogue an entry comes from
         self._fmt     = fmt
         self._text    = {}                 # fmt -> {source index: (ra_text, dec_text)}
         self._link_font  = QFont(); self._link_font.setUnderline(True)
@@ -1141,6 +1424,8 @@ class _ServicePage(QWidget):
             tdesc = otypes.get(otype, ("", ""))[1] or otype
             z_txt = (src.get("rvz_redshift") or "").strip()
             bib, what = pick_reference(src)
+            if self.service == CLUSTERS:
+                what = "catalogue"
 
             first = _SortItem(name, name.casefold())
             first.setData(Qt.UserRole, idx)              # index into manager.sources
@@ -1365,9 +1650,10 @@ class SimbadManager(QObject):
     """
     Owns everything belonging to the look-up overlay of one ImageViewer.
 
-    NED and SIMBAD are always queried together, in parallel.  NED objects get
-    green circles, SIMBAD objects yellow squares.  One service failing or
-    being slow does not hold up the other.
+    NED, SIMBAD and the galaxy-cluster catalogues (VizieR) are always queried
+    together, in parallel.  NED objects get green circles, SIMBAD objects yellow
+    squares, cluster-catalogue entries cyan diamonds.  One service failing or
+    being slow does not hold up the others.
 
     Public API (called by ImageViewer / ControlDock)
     ------------------------------------------------
@@ -1378,7 +1664,7 @@ class SimbadManager(QObject):
     center_on(idx)                 centre the view on an object (table row click)
 
     ``sources`` / ``items`` hold the objects of both services in arrival
-    order; each source dict carries ``_source`` ("NED" or "SIMBAD").
+    order; each source dict carries ``_source`` ("NED", "SIMBAD" or "Clusters").
     """
 
     def __init__(self, viewer):
@@ -1388,12 +1674,13 @@ class SimbadManager(QObject):
         self.items    = []          # QGraphicsItem (circle or square), parallel to sources
         self._xy      = np.empty((0, 2))
         self._radius  = np.empty(0)
-        self._square  = np.empty(0, dtype=bool)     # True for SIMBAD squares
+        self._kind    = np.empty(0, dtype=int)      # marker shape: 0 circle (NED), 1 square (SIMBAD), 2 diamond
         self.otypes   = {}          # service -> {code: (label, description)}
         self._gen     = 0           # bumped by start_lookup() and clear()
         self._workers = {}          # (gen, service) -> worker, keeps them alive while running
-        self._relays  = {s: _Relay(self, s) for s in SOURCES}
-        self._st      = {s: self._new_state() for s in SOURCES}
+        self.services = tuple(s for s in SOURCES if s != CLUSTERS or _clusters_enabled())
+        self._relays  = {s: _Relay(self, s) for s in self.services}
+        self._st      = {s: self._new_state() for s in self.services}
         self._selected = None       # index of the highlighted object
         self._dialog  = None        # SimbadDetailsDialog (one, reused)
         self._table   = None        # SimbadTableDialog
@@ -1437,17 +1724,20 @@ class SimbadManager(QObject):
 
         self._gen += 1
         now = time.monotonic()
-        for service, worker_class in (("NED", NedQueryWorker), ("SIMBAD", SimbadQueryWorker)):
+        classes = {"NED": NedQueryWorker, "SIMBAD": SimbadQueryWorker, CLUSTERS: ClusterQueryWorker}
+        for service in self.services:
+            worker_class = classes[service]
             relay  = self._relays[service]
             worker = worker_class(self._gen, centre[0], centre[1], radius)
             worker.finished.connect(relay.finished)
             worker.error.connect(relay.error)
             worker.progress.connect(relay.progress)
             self._workers[(self._gen, service)] = worker
-            self._st[service] = dict(self._new_state(), state="pending", stage=f"contacting {service}", t0=now)
+            who = "VizieR" if service == CLUSTERS else service
+            self._st[service] = dict(self._new_state(), state="pending", stage=f"contacting {who}", t0=now)
         self._timer.start()
         self._publish()
-        for service in SOURCES:
+        for service in self.services:
             worker = self._workers[(self._gen, service)]
             threading.Thread(target=worker.run, name=f"{service.lower()}-lookup", daemon=True).start()
         return True
@@ -1479,7 +1769,7 @@ class SimbadManager(QObject):
 
     def _publish(self):
         """One status-bar line with the state of both services."""
-        msg = "  |  ".join(self._status_part(s) for s in SOURCES)
+        msg = "  |  ".join(self._status_part(s) for s in self.services)
         self._say(msg, 0 if not self._all_done() else 20000)
         if self._all_done():
             self._timer.stop()
@@ -1498,6 +1788,8 @@ class SimbadManager(QObject):
             parts.append(f"via {t['mirror']}")
         for f in t.get("failovers", []):
             parts.append(f"failed over from {f}")
+        for f in t.get("failed", []):
+            parts.append(f"unavailable: {f}")
         if t.get("schema", 0) >= 0.5:
             parts.append(f"schema check {t['schema']:.1f} s")
         if t.get("types", 0) >= 0.5:
@@ -1536,8 +1828,8 @@ class SimbadManager(QObject):
 
         pix_arcsec = self._pixel_scale_arcsec(w, h)
         default_r  = max(MIN_RADIUS_PX, DEFAULT_RADIUS_ARCSEC / pix_arcsec) if pix_arcsec else 12.0
-        square     = service == "SIMBAD"
-        colour     = SQUARE_COLOR if square else CIRCLE_COLOR
+        kind       = {"NED": 0, "SIMBAD": 1, CLUSTERS: 2}[service]
+        colour     = (CIRCLE_COLOR, SQUARE_COLOR, CLUSTER_COLOR)[kind]
 
         self.otypes[service] = info.get("otypes", {})
         base = len(self.sources)
@@ -1554,7 +1846,10 @@ class SimbadManager(QObject):
                 r["_x"], r["_y"] = float(xi), float(yi)
                 r["_yfits"] = float(h - yi)           # same convention as the dock's x/y readout
 
-                if square:
+                if kind == 2:
+                    item = _SourceDiamond.around(xi, yi, radius * DIAMOND_SCALE)
+                    item.setZValue(1000.0 / radius - 1.0)        # diamonds below squares, squares below circles
+                elif kind == 1:
                     half = radius * SQUARE_SCALE
                     item = _SourceSquare(QRectF(xi - half, yi - half, 2 * half, 2 * half))
                     item.setZValue(1000.0 / radius - 0.5)        # squares below circles of equal size
@@ -1579,19 +1874,24 @@ class SimbadManager(QObject):
         if mine:
             self._xy = np.vstack([self._xy, np.array([[r["_x"], r["_y"]] for _, r in mine])])
         self._radius = np.concatenate([self._radius, np.array(radii)])
-        self._square = np.concatenate([self._square, np.full(len(mine), square, dtype=bool)])
+        self._kind = np.concatenate([self._kind, np.full(len(mine), kind, dtype=int)])
 
         n = len(mine)
         timing = self._timing_text(info.get("timing", {}), secs)
-        full = f"{service}: {n:,} source{'s' if n != 1 else ''} in the field of view ({timing})"
-        short = f"{service}: {n:,} source{'s' if n != 1 else ''}"
+        noun, nouns = ("cluster entry", "cluster entries") if service == CLUSTERS else ("source", "sources")
+        full = f"{service}: {n:,} {noun if n == 1 else nouns} in the field of view ({timing})"
+        short = f"{service}: {n:,}" + ("" if service == CLUSTERS else f" {noun if n == 1 else nouns}")
         cached = info.get("timing", {}).get("cached_days")
         short += f" ({'cache' if cached is not None else f'{secs:.1f} s'})"
+        n_failed = len(info.get("timing", {}).get("failed", []))
+        if n_failed:
+            short += f" — {n_failed} catalogue{'s' if n_failed != 1 else ''} unavailable"
         if info.get("truncated"):
-            full  += f" — query capped at {MAX_SOURCES:,}; list is incomplete"
+            cap = CLUSTER_MAXREC if service == CLUSTERS else MAX_SOURCES
+            full  += f" — query capped at {cap:,}; list is incomplete"
             short += " — capped, list incomplete"
         elif n == 0:
-            full  = f"{service}: no known sources in the field of view ({timing})"
+            full  = f"{service}: no known {'cluster entries' if service == CLUSTERS else 'sources'} in the field of view ({timing})"
             short = f"{service}: none ({secs:.1f} s)"
         st.update(state="ok", n=n, secs=secs, text=short, timing=timing, truncated=bool(info.get("truncated")))
         print(full)                     # full detail on the console, for timing comparisons
@@ -1601,7 +1901,7 @@ class SimbadManager(QObject):
             if self._table is not None:
                 self._table.populate_service(service, mine, self.otypes[service], timing)
         elif self._table is not None:
-            self._table.set_note(service, "none", f"No {service} objects in the field of view.", timing)
+            self._table.set_note(service, "none", self._none_note(service), timing)
         self._publish()
         self._release_if_failed()
 
@@ -1616,6 +1916,12 @@ class SimbadManager(QObject):
             self._table.set_note(service, "failed", message, message)
         self._publish()
         self._release_if_failed()
+
+    @staticmethod
+    def _none_note(service: str) -> str:
+        if service == CLUSTERS:
+            return "No catalogued galaxy clusters in the field of view."
+        return f"No {service} objects in the field of view."
 
     def _release_if_failed(self):
         """All answers are in, none drew anything and some failed: release the button."""
@@ -1632,7 +1938,8 @@ class SimbadManager(QObject):
 
         Inside a NED circle -> that NED object; in the margin between circle and
         square (or inside a SIMBAD square with no circle there) -> the SIMBAD
-        object.  Failing an exact hit, the nearest object within *hit_radius*.
+        object; further out, inside a cluster diamond -> the cluster entry.
+        Failing an exact hit, the nearest object within *hit_radius*.
         """
         if not len(self.items):
             return False
@@ -1640,7 +1947,7 @@ class SimbadManager(QObject):
         dy = self._xy[:, 1] - scene_pos.y()
         d  = np.hypot(dx, dy)                                   # distance to the centre
         dsq = np.maximum(np.abs(dx), np.abs(dy))                # "square distance"
-        circle, square = ~self._square, self._square
+        circle, square, diamond = self._kind == 0, self._kind == 1, self._kind == 2
 
         def nearest(mask):
             hit = np.flatnonzero(mask)
@@ -1649,8 +1956,10 @@ class SimbadManager(QObject):
         idx = nearest(circle & (d <= self._radius))
         if idx is None:
             idx = nearest(square & (dsq <= self._radius * SQUARE_SCALE))
+        if idx is None:
+            idx = nearest(diamond & (np.abs(dx) + np.abs(dy) <= self._radius * DIAMOND_SCALE))
         if idx is None:                                         # forgiving slop for tiny objects
-            idx = nearest((circle & (d <= hit_radius)) | (square & (dsq <= hit_radius)))
+            idx = nearest((circle & (d <= hit_radius)) | ((square | diamond) & (dsq <= hit_radius)))
         if idx is None:
             return False
         self.show_details(idx)
@@ -1670,6 +1979,9 @@ class SimbadManager(QObject):
 
         if src.get("_source") == "NED":
             self._show_ned_details(src)
+            return
+        if src.get("_source") == CLUSTERS:
+            self._alias_current = None                  # nothing to fetch
             return
 
         oid = (src.get("oid") or "").strip()
@@ -1749,17 +2061,17 @@ class SimbadManager(QObject):
         if self._table is not None or self._table_opened:
             return
         self._table_opened = True
-        self._table = SimbadTableDialog(self.viewer)
+        self._table = SimbadTableDialog(self.viewer, services=self.services)
         self._table.row_clicked.connect(self.center_on)
         self._table.row_activated.connect(self.show_details)
-        for service in SOURCES:                          # services that are still out / already empty
+        for service in self.services:                    # services that are still out / already empty
             st = self._st[service]
             if st["state"] == "pending":
                 self._table.set_note(service, "querying …", f"Waiting for {service} …")
             elif st["state"] == "error":
                 self._table.set_note(service, "failed", st["timing"], st["timing"])
             elif st["state"] == "ok" and st["n"] == 0:
-                self._table.set_note(service, "none", f"No {service} objects in the field of view.", st["timing"])
+                self._table.set_note(service, "none", self._none_note(service), st["timing"])
         self._table.show()
 
     def _open_table(self):
@@ -1769,7 +2081,7 @@ class SimbadManager(QObject):
         self._ensure_table()
         if self._table is None:
             return
-        for service in SOURCES:
+        for service in self.services:
             entries = [(i, r) for i, r in enumerate(self.sources) if r.get("_source") == service]
             if entries:
                 self._table.populate_service(service, entries, self.otypes.get(service, {}),
@@ -1782,7 +2094,6 @@ class SimbadManager(QObject):
             self._table = None
 
     def _select(self, idx: int):
-        import sip
         if self._selected is not None and self._selected < len(self.items):
             old = self.items[self._selected]
             if not sip.isdeleted(old):
@@ -1796,7 +2107,6 @@ class SimbadManager(QObject):
 
     def clear(self):
         """Remove the overlay and the catalogs, and cancel any pending query."""
-        import sip
         self._gen += 1                       # makes any in-flight answer stale
         self._timer.stop()
         for item in self.items:
@@ -1809,8 +2119,8 @@ class SimbadManager(QObject):
             self.viewer.scene.update()
         self.items, self.sources, self.otypes = [], [], {}
         self._xy, self._radius = np.empty((0, 2)), np.empty(0)
-        self._square = np.empty(0, dtype=bool)
-        self._st = {s: self._new_state() for s in SOURCES}
+        self._kind = np.empty(0, dtype=int)
+        self._st = {s: self._new_state() for s in self.services}
         self._selected = None
         self._alias_cache, self._alias_current = {}, None
         self._ned_cache = {}
@@ -1835,8 +2145,11 @@ class SimbadManager(QObject):
         service = src.get("_source", "")
         otype = (src.get("otype") or "").strip()
         label = self.otypes.get(service, {}).get(otype, ("", ""))[1] or otype
+        z = (src.get("rvz_redshift") or "").strip() if service in ("NED", CLUSTERS) else ""
+        if service == CLUSTERS:                       # the catalogue is the "type"; name it once, at the end
+            zt = f" &nbsp;z = {html.escape(z)}" if z else ""
+            return f"<b>{name}</b>{zt} &nbsp;<small>({html.escape(otype)}, cluster catalogue)</small>"
         extra = f" &nbsp;<i>{html.escape(label)}</i>" if label else ""
-        z = (src.get("rvz_redshift") or "").strip() if service == "NED" else ""
         if z:
             extra += f" &nbsp;z = {html.escape(z)}"
         return f"<b>{name}</b>{extra} &nbsp;<small>({service})</small>"

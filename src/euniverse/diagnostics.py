@@ -48,6 +48,7 @@ import threading
 import time
 from datetime import datetime
 
+from .paths import cache_dir
 from PyQt5.QtCore import PYQT_VERSION_STR, QEvent, QObject, QT_VERSION_STR, QTimer
 from PyQt5.QtWidgets import QApplication
 
@@ -74,13 +75,7 @@ def _enabled() -> bool:
 
 
 def _diag_dir() -> str:
-    if sys.platform == "win32":
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    elif sys.platform == "darwin":
-        base = os.path.join(os.path.expanduser("~"), "Library", "Caches")
-    else:
-        base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-    return os.path.join(base, "euniverse", "diagnostics")
+    return cache_dir("diagnostics")
 
 
 def _read(path: str) -> str:

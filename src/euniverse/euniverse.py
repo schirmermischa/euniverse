@@ -131,6 +131,24 @@ def _prefer_xcb_on_wayland():
         os.environ["QT_QPA_PLATFORM"] = "xcb;wayland"
 
 
+def _enable_high_dpi():
+    """
+    Windows and macOS laptops usually run at 125-200 % display scaling: ask Qt
+    to scale the interface (and use the exact factor, not a rounded one) and
+    to render pixmaps at device resolution.  Must run before QApplication is
+    created.  Linux is left alone (the desktop's own setting applies there).
+    """
+    if sys.platform not in ("win32", "darwin"):
+        return
+    if hasattr(Qt, "AA_EnableHighDpiScaling"):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt, "AA_UseHighDpiPixmaps"):
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    policy = getattr(Qt, "HighDpiScaleFactorRoundingPolicy", None)          # Qt >= 5.14
+    if policy is not None and hasattr(QApplication, "setHighDpiScaleFactorRoundingPolicy"):
+        QApplication.setHighDpiScaleFactorRoundingPolicy(policy.PassThrough)
+
+
 def main():
     # 1. Versioning
     try:
@@ -151,6 +169,7 @@ def main():
 
     # 3. Application Lifecycle
     _prefer_xcb_on_wayland()
+    _enable_high_dpi()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     

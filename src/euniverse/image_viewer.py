@@ -74,6 +74,11 @@ from PyQt5.QtWidgets import (
     QGraphicsRectItem, QGraphicsLineItem, QGraphicsItemGroup,
 )
 
+try:
+    from PyQt5 import sip            # PyQt5 >= 5.11 ships its own sip; a top-level ``sip`` is not
+except ImportError:                  # guaranteed (e.g. the pip wheels on Windows)
+    import sip
+
 from .annotations     import Annotation
 from .catalog_manager import CatalogManager
 from .image_exporter  import ImageExporter
@@ -641,7 +646,6 @@ class ImageViewer(QGraphicsView):
         wrappers.  sip.isdeleted() is used as a defensive backstop in case
         some items were already destroyed by an earlier scene.clear().
         """
-        import sip
         for ann in self.annotations:
             try:
                 if not sip.isdeleted(ann.item) and ann.item.scene() == self.scene:
@@ -1239,7 +1243,6 @@ class ImageViewer(QGraphicsView):
             return
 
         elif event.button() == Qt.RightButton:
-            import sip
             # Remove an existing circle if the click is close enough to one
             for ann in self.annotations[:]:
                 if sip.isdeleted(ann.item):
@@ -1444,7 +1447,6 @@ class ImageViewer(QGraphicsView):
         annotation circle.  Applies highlight styling and returns True if an
         object was handled (suppresses the default preview refresh).
         """
-        import sip
 
         # Hit radius in scene space.  10 screen pixels divided by the current
         # zoom factor converts to the equivalent scene-space radius so the
@@ -1515,9 +1517,8 @@ class ImageViewer(QGraphicsView):
         return False
 
     def keyPressEvent(self, event):
-        """Delete key removes the currently selected annotation circle."""
-        if event.key() == Qt.Key_Delete and self.control_dock:
-            import sip
+        """Delete (or Backspace, the only delete key on Mac keyboards) removes the selected annotation circle."""
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self.control_dock:
             target_ann = None
 
             # Priority 1: delete by item identity — the visually thickened

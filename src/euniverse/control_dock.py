@@ -312,8 +312,8 @@ class ControlDock(QWidget):
         image_path = self.viewer.tileID
         base_name  = os.path.splitext(os.path.basename(image_path))[0]
         username   = getpass.getuser()
-        timestamp  = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-        csv_filename = f"{self.viewer.dirpath}/{base_name}_{username}_{timestamp}.csv"
+        timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")      # no ':' — illegal in Windows file names
+        csv_filename = os.path.join(self.viewer.dirpath, f"{base_name}_{username}_{timestamp}.csv")
 
         with open(csv_filename, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
@@ -329,7 +329,7 @@ class ControlDock(QWidget):
 
         username     = getpass.getuser()
         timestamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_filename = f"{self.viewer.dirpath}/image_{username}_{timestamp}.csv"
+        csv_filename = os.path.join(self.viewer.dirpath, f"image_{username}_{timestamp}.csv")
 
         with open(csv_filename, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)

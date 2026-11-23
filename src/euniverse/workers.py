@@ -158,7 +158,7 @@ class CsvUploader(QObject):
         self._csv_path = csv_path
 
     def run(self):
-        """Entry point — called by QThread.started signal."""
+        """Entry point — runs in a plain Python thread started by ControlDock.on_submit_targets."""
         import requests  # imported here so the rest of the app has no hard dep
 
         try:
