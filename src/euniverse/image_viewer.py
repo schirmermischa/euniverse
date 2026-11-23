@@ -55,6 +55,7 @@ What is NOT here
 import os
 import re
 import gc
+import threading
 import logging
 
 import numpy as np
@@ -62,7 +63,7 @@ from PIL import Image
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 
-from PyQt5.QtCore import Qt, QPointF, QRectF, QPoint, QThread, pyqtSignal, QObject, QSize, QSizeF
+from PyQt5.QtCore import Qt, QPointF, QRectF, QPoint, pyqtSignal, QObject, QSize, QSizeF
 from PyQt5.QtGui import (QPixmap, QImage, QPainter, QPen, QColor, QFont,
                          QCursor, QTransform)
 from PyQt5.QtWidgets import (
@@ -77,6 +78,7 @@ from .annotations     import Annotation
 from .catalog_manager import CatalogManager
 from .image_exporter  import ImageExporter
 from .workers         import TiffLoader
+from . import diagnostics
 from .wcs_utils       import WCSConverter, InvalidWCSError
 from .curve_math      import eval_curve
 from .simbad_lookup   import SimbadManager
@@ -153,9 +155,16 @@ class ImageViewer(QGraphicsView):
         # ---- Control dock reference (injected via set_control_dock) ----
         self.control_dock = None
 
-        # ---- Background load thread ----
-        self.load_thread = None
-        self.load_worker = None
+        # ---- Background load ----
+        # The TIFF is read by a plain Python thread, NOT a QThread: destroying
+        # a QThread (or its moved-to-thread worker) from Python can deadlock,
+        # because ~QThread waits for the thread to finish while the main thread
+        # still holds the GIL that the finishing thread needs.  A superseded
+        # load cannot be stopped; its result is recognised by its generation
+        # number and dropped.
+        self._load_gen     = 0       # generation of the most recent load_image()
+        self._load_pending = False   # that load has not delivered its result yet
+        self._loaders      = {}      # generation -> TiffLoader, alive until its result arrives
 
         # ---- Contrast engine state ----
         # Maps (min_val, max_val) -> uint8 numpy LUT array (linear stretch only)
@@ -317,35 +326,53 @@ class ImageViewer(QGraphicsView):
 
     def load_image(self, path: str):
         """
-        Spin up a TiffLoader worker thread for *path*.
-        Any already-running load is cleanly aborted first to prevent
-        two threads from racing to call on_image_loaded.
+        Start reading *path* in a background thread.
+
+        A load that is still in flight is abandoned (its thread runs to the
+        end, but its result is ignored), so two loads can never race to call
+        on_image_loaded.
         """
-        if self.load_thread and self.load_thread.isRunning():
-            self.load_thread.quit()
-            self.load_thread.wait()
-            self.load_thread = None
-            self.load_worker = None
-            QApplication.restoreOverrideCursor()   # balances the aborted load's wait cursor
+        if self._load_pending:
+            QApplication.restoreOverrideCursor()    # balances the abandoned load's wait cursor
+
+        self._load_gen += 1
+        gen = self._load_gen
+        self._load_pending = True
 
         # Wait cursor is set here, on the GUI thread (never in the worker);
         # on_image_loaded() / _on_loader_error() restore it.
         QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        diagnostics.begin(path)        # hang diagnostics: log is deleted when the load succeeds
 
-        self.load_thread = QThread()
-        self.load_worker = TiffLoader(path)
-        self.load_worker.moveToThread(self.load_thread)
+        loader = TiffLoader(path)      # a QObject of the GUI thread; its signals are queued across threads
+        loader.generation = gen
+        self._loaders[gen] = loader
+        loader.finished.connect(self.on_image_loaded)
+        loader.error.connect(self._on_loader_error)
+        threading.Thread(target=loader.run, name=f"euniverse-loader-{gen}", daemon=True).start()
 
-        self.load_thread.started.connect(self.load_worker.run)
-        self.load_worker.finished.connect(self.load_thread.quit)
-        self.load_worker.finished.connect(self.load_worker.deleteLater)
-        self.load_worker.finished.connect(self.on_image_loaded)
-        self.load_worker.error.connect(self._on_loader_error)
-        self.load_thread.start()
+    def _result_is_stale(self) -> bool:
+        """
+        True if the signal being handled comes from a TiffLoader that has been
+        superseded by a newer load_image() call.  Also retires the loader.
+        (Direct calls, e.g. from tests, have no loader as sender: never stale.)
+        """
+        gen = getattr(self.sender(), "generation", None)
+        if gen is None:
+            return False
+        self._loaders.pop(gen, None)
+        if gen != self._load_gen:
+            diagnostics.mark(f"ignoring the result of superseded load #{gen}")
+            return True
+        self._load_pending = False
+        return False
 
     def _on_loader_error(self, message: str):
         """TiffLoader.error slot: report the failure and release the wait cursor."""
+        if self._result_is_stale():
+            return
         self.on_load_error(message)
+        diagnostics.end(False, f"loader error: {message}")
         QApplication.restoreOverrideCursor()
 
     def on_image_loaded(self, image: np.ndarray, metadata: dict, path: str):
@@ -355,8 +382,13 @@ class ImageViewer(QGraphicsView):
         Builds the initial contrast display, creates the navigator thumbnail,
         and loads the matching MER catalog.
         """
+        if self._result_is_stale():
+            return
+        load_ok, load_note = True, ""
+        diagnostics.mark("on_image_loaded: entered (GUI thread)")
         try:
             self.reset()
+            diagnostics.mark("on_image_loaded: viewer reset")
 
             self.update_status("Processing TIFF …")
             self.original_image = image
@@ -388,6 +420,7 @@ class ImageViewer(QGraphicsView):
                     self.control_dock.set_wcs_available(False)
 
             h, w = image.shape[:2]
+            diagnostics.mark("on_image_loaded: WCS done; building the navigator thumbnail")
 
             # Build a downscaled navigator thumbnail (longest axis ≤ 1000 px)
             scale = min(1000 / max(h, w), 1.0)
@@ -402,16 +435,19 @@ class ImageViewer(QGraphicsView):
                 self.preview_image = scipy_zoom(image, scale, order=1)
 
             # Apply default full-range contrast and show the image
+            diagnostics.mark("on_image_loaded: thumbnail done; applying contrast")
             self.update_status("Applying contrast …")
             self.control_dock.max_slider.setValue(65535)
             self.apply_contrast(0, 65535)
             self.centerOn(QPointF(w / 2, h / 2))
 
             # Populate the navigator with the current viewport crop
+            diagnostics.mark("on_image_loaded: contrast applied; updating the navigator")
             self.update_status("Updating navigator …")
             self.get_visible_qimage_pixmap()
 
             # Tile identity and MER catalog
+            diagnostics.mark("on_image_loaded: navigator done; loading the MER catalog")
             self.tileID, self.title = self.extract_tileID(path)
             if self.title:
                 self.set_main_window_title(f"Euniverse Explorer – {self.title}")
@@ -426,28 +462,25 @@ class ImageViewer(QGraphicsView):
                 self.update_status("No TILE id in filename — catalog skipped.")
 
             self.default_image = path
+            diagnostics.mark("on_image_loaded: catalog done; emitting image_loaded")
             self.image_loaded.emit(image, metadata, path)
             n = self.catalog_manager.numsources if self.catalog_manager else 0
             self.update_status(f"TIFF loaded — {n} MER sources found.")
 
         except ValueError as ve:
+            load_ok, load_note = False, f"ValueError: {ve}"
             self.on_load_error(str(ve))
         except Exception as e:
+            load_ok, load_note = False, f"unexpected error: {e!r}"
             self.on_load_error(f"Unexpected error in on_image_loaded: {e}")
 
+        diagnostics.end(load_ok, load_note)
         QApplication.restoreOverrideCursor()
 
     def on_load_error(self, message: str):
         """Slot for TiffLoader.error and internal on_image_loaded exceptions."""
         self.update_status(f"Error loading TIFF: {message}")
         print(f"Error loading TIFF: {message}")
-        if self.load_thread:
-            self.load_thread.quit()
-            self.load_thread.wait()
-            self.load_thread = None
-        if self.load_worker:
-            self.load_worker.deleteLater()
-            self.load_worker = None
 
     # ------------------------------------------------------------------
     # State reset
@@ -458,7 +491,7 @@ class ImageViewer(QGraphicsView):
         Reset all viewer state in preparation for loading a new image.
 
         Order matters:
-          0. Abort any in-flight background thread first.
+          0. (Nothing to abort: a superseded load's result is ignored.)
           1. Remove annotation circles before scene.clear() to avoid dangling
              C++ wrappers (QGraphicsEllipseItem destroyed by scene.clear while
              Python still holds a reference to the wrapper object → crash).
@@ -467,13 +500,6 @@ class ImageViewer(QGraphicsView):
           4. Call scene.clear() — safe now that all items are removed.
           5. Force a GC cycle.
         """
-        # 0. Abort in-flight load
-        if self.load_thread and self.load_thread.isRunning():
-            self.load_thread.quit()
-            self.load_thread.wait()
-        self.load_thread = None
-        self.load_worker = None
-
         # 1. Annotation circles (must precede scene.clear)
         self.clear_annotations()
         # SIMBAD circles are scene items too, and the retrieved sources

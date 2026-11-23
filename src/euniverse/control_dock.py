@@ -52,10 +52,11 @@ from PyQt5.QtWidgets import (
     QHBoxLayout, QFrame, QVBoxLayout,
 )
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QCursor, QIcon
-from PyQt5.QtCore import Qt, QPointF, QRectF, QSize, QThread
+from PyQt5.QtCore import Qt, QPointF, QRectF, QSize
 from PyQt5 import uic
 import os
 import getpass
+import threading
 from datetime import datetime
 import csv
 from astropy.coordinates import SkyCoord
@@ -204,8 +205,8 @@ class ControlDock(QWidget):
         self.lookupPushButton.setIconSize(QSize(32, 32))
         self.lookupPushButton.setStyleSheet(button_style)
         self.lookupPushButton.toggled.connect(self.on_lookup_toggled)
-        self.lookupPushButton.setToolTip("Look up known objects in the field of view: "
-                                         "NED (green circles) and SIMBAD (yellow squares)")
+        self.lookupPushButton.setToolTip("Look up known objects in the field of view: NED (green circles), "
+                                         "SIMBAD (yellow squares) and galaxy-cluster catalogues (cyan diamonds)")
 
         self.logScalePushButton.setStyleSheet(button_style)
         self.logScalePushButton.toggled.connect(self.on_log_scale_toggled)
@@ -338,14 +339,16 @@ class ControlDock(QWidget):
                 writer.writerow([ann.ra, ann.dec, ann.classifier])
 
         # Upload in a background thread so the UI stays responsive.
-        # CsvUploader is defined in workers.py.
-        self._upload_thread  = QThread()
-        self._uploader       = CsvUploader(csv_filename)
-        self._uploader.moveToThread(self._upload_thread)
-        self._upload_thread.started.connect(self._uploader.run)
-        self._uploader.done.connect(self.update_status)
-        self._uploader.done.connect(self._upload_thread.quit)
-        self._upload_thread.start()
+        # CsvUploader is defined in workers.py.  A plain Python thread is used,
+        # not a QThread: destroying a QThread from Python (e.g. when a second
+        # upload replaces the first) can deadlock on the GIL.  The uploader is
+        # a QObject of this (GUI) thread, so its `done` signal is queued here.
+        self._uploads = [(u, t) for u, t in getattr(self, "_uploads", []) if t.is_alive()]
+        uploader = CsvUploader(csv_filename)
+        uploader.done.connect(self.update_status)
+        thread = threading.Thread(target=uploader.run, name="euniverse-upload", daemon=True)
+        self._uploads.append((uploader, thread))       # keeps the uploader alive until its thread has ended
+        thread.start()
 
     def slider_pressed(self):
         # Save the current view centre so we can restore it after the full pass
@@ -806,8 +809,8 @@ class ControlDock(QWidget):
     def on_lookup_toggled(self, checked):
         """
         Look-up button: ON queries NED and SIMBAD for the field of view and
-        overlays green circles (NED) and yellow squares (SIMBAD); OFF removes
-        them and discards the catalogs.  The queries run in the background
+        overlays green circles (NED), yellow squares (SIMBAD) and cyan diamonds
+        (cluster catalogues); OFF removes them and discards the catalogs.  The queries run in the background
         (see simbad_lookup.SimbadManager).
         """
         if not self.viewer:

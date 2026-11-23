@@ -85,37 +85,43 @@ class ImageExporter:
 
     def _save_image(self, qimage: QImage, filename: str) -> bool:
         """
-        Save *qimage* to *filename* as PNG.
+        Save *qimage* as PNG after asking the user where and under which name.
 
-        If the file already exists the user is shown a Save-As dialog so they
-        can choose a different name or overwrite intentionally.  Returns True
-        on success, False if the user cancelled or the write failed.
+        A "Save image as" dialog opens with *filename* (the coordinate-based
+        default) already filled in, so the user can edit it or just accept.
+        If the chosen file exists, the dialog itself asks before overwriting.
+        A missing ".png" extension is added.  Returns True on success, False
+        if the user cancelled or the write failed.
         """
         v = self._v
 
-        if not os.path.exists(filename):
-            if qimage.save(filename, "png"):
-                v.update_status(f"Saved: {filename}")
-                return True
-            QMessageBox.critical(None, "Error", f"Failed to save to: {filename}")
+        # Rubber-band mode leaves an app-wide cross-hair override cursor set;
+        # show a normal arrow while the dialog is open, then restore the stack.
+        QApplication.setOverrideCursor(Qt.ArrowCursor)
+        try:
+            new_name, _ = QFileDialog.getSaveFileName(
+                v,
+                "Save image as",
+                filename,
+                "PNG Files (*.png);;All Files (*)",
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not new_name:
+            v.update_status("Save cancelled.")
             return False
-
-        # File exists — ask for a new name
-        new_name, _ = QFileDialog.getSaveFileName(
-            None,
-            "File Already Exists — Choose New Name",
-            filename,
-            "PNG Files (*.png);;All Files (*)",
-        )
-        if new_name:
-            if qimage.save(new_name, "png"):
-                v.update_status(f"Saved: {new_name}")
-                return True
-            QMessageBox.critical(None, "Error", f"Failed to save to: {new_name}")
-            return False
-
-        v.update_status("Save cancelled.")
+        if not os.path.splitext(new_name)[1]:
+            new_name += ".png"
+        if qimage.save(new_name, "png"):
+            v.update_status(f"Saved: {new_name}")
+            return True
+        QMessageBox.critical(v, "Error", f"Failed to save to: {new_name}")
         return False
+
+    @staticmethod
+    def _coord_tag(ra: float, dec: float) -> str:
+        """'RA+Dec' for file names: no separator, the sign of Dec splits them (e.g. 150.123456+2.12345)."""
+        return f"{ra:.6f}{dec:+.5f}"
 
     def _make_wcs_filename(self, scene_x: float, scene_y: float) -> str:
         """
@@ -133,7 +139,7 @@ class ImageExporter:
             return os.path.join(v.dirpath, f"{v.tileID}_x{scene_x:.0f}_y{scene_y:.0f}.png")
         flipped_y = v.original_image.shape[0] - scene_y
         ra, dec    = v.wcs.pixel_to_world(scene_x, flipped_y)
-        return os.path.join(v.dirpath, f"{v.tileID}_{ra:.6f}_{dec:.5f}.png")
+        return os.path.join(v.dirpath, f"{v.tileID}_{self._coord_tag(ra, dec)}.png")
 
     # ------------------------------------------------------------------
     # Public export methods
@@ -275,7 +281,7 @@ class ImageExporter:
         else:
             filename = os.path.join(
                 v.dirpath,
-                f"{v.tileID}_{v.crosshair_ra:.6f}_{v.crosshair_dec:.5f}.png"
+                f"{v.tileID}_{self._coord_tag(v.crosshair_ra, v.crosshair_dec)}.png"
             )
         self._save_image(buffer, filename)
 

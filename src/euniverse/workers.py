@@ -53,6 +53,8 @@ import json
 import numpy as np
 import tifffile
 
+from . import diagnostics
+
 from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtGui import QCursor
 from PyQt5.QtCore import Qt
@@ -87,7 +89,10 @@ class TiffLoader(QObject):
         self.path = path
 
     def run(self):
-        """Entry point — called by QThread.started signal."""
+        """
+        Entry point.  Runs in a plain Python thread started by
+        ImageViewer.load_image (the signals are queued to the GUI thread).
+        """
         try:
             # NOTE: no cursor handling here.  QApplication.setOverrideCursor()
             # and restoreOverrideCursor() are GUI-thread-only; calling them
@@ -95,8 +100,11 @@ class TiffLoader(QObject):
             # ("QObject::startTimer: Timers cannot be started from another
             # thread", seen on Wayland).  ImageViewer.load_image() sets the
             # wait cursor and the finished/error slots restore it.
+            diagnostics.mark("loader: opening the TIFF")
             with tifffile.TiffFile(self.path) as tif:
+                diagnostics.mark("loader: reading the pixel data")
                 image = tif.pages[0].asarray()
+                diagnostics.mark(f"loader: pixel data read, shape {image.shape}, dtype {image.dtype}, {image.nbytes / 1e6:.0f} MB")
 
                 if 'ImageDescription' not in tif.pages[0].tags:
                     raise ValueError("No ImageDescription tag found in TIFF metadata")
@@ -107,12 +115,16 @@ class TiffLoader(QObject):
                 except json.JSONDecodeError:
                     raise ValueError("Invalid JSON in ImageDescription tag")
 
+            diagnostics.mark("loader: metadata parsed, emitting finished")
             self.finished.emit(image, metadata, self.path)
+            diagnostics.mark("loader: finished emitted (loader thread done)")
 
         except ValueError as ve:
+            diagnostics.mark(f"loader: error {ve}")
             self.error.emit(str(ve))
 
         except Exception as e:
+            diagnostics.mark(f"loader: unexpected error {e!r}")
             self.error.emit(f"Unexpected error loading TIFF: {e}")
 
 
